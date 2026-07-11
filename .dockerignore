@@ -1,0 +1,27 @@
+# Pastas de dependências e ambientes virtuais
+**/node_modules
+**/bower_components
+**/venv
+**/env
+**/docker
+
+# Arquivos de configuração sensíveis e de ambiente
+.env
+.env.local
+.aws/
+.ssh/
+
+# Pastas de controle de versão e logs
+.git
+.gitignore
+**/coverage
+**/logs
+*.log
+
+# Arquivos de sistema e do próprio projeto
+Dockerfile
+README.md
+CLAUDE.md
+docker-compose.yml
+docker-compose-local.yml
+.DS_Store
