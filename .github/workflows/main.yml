@@ -3,7 +3,7 @@ name: Build and Deploy Docker Image
 on:
   push:
     branches:
-      - main  # ou a branch que você quiser usar
+      - AJUSTAR  # ou a branch que você quiser usar
 jobs:
   build-deploy:
     runs-on: ubuntu-latest
@@ -27,11 +27,9 @@ jobs:
             file: ./Dockerfile
             push: true
             platforms: linux/amd64
-            tags: diegoneumann/daizen:latest
-            cache-from: type=registry,ref=diegoneumann/daizen:cache
-            cache-to: type=registry,ref=diegoneumann/daizen:cache,mode=max
-            build-args: |
-              NOVA_USER=${{ secrets.NOVA_USER }}
-              NOVA_KEY=${{ secrets.NOVA_KEY }}
+            tags: diegoneumann/apy-gateway:latest
+            cache-from: type=registry,ref=diegoneumann/apy-gateway:cache
+            cache-to: type=registry,ref=diegoneumann/apy-gateway:cache,mode=max
+
 
 
