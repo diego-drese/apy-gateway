@@ -1,0 +1,71 @@
+# End-to-end verification harness (Fase 5 + Fase 6) — NOT part of the dev environment (that's
+# Fase 10's job). Spins up throwaway MySQL/MinIO/Redis/backend + the real apy-gateway-nginx
+# image so the bootstrap/sync flow (SPEC.md §9.1) and real-time sync/reconciliation/heartbeat
+# (SPEC.md §9.2) can be exercised against real infrastructure, not mocks.
+# See README.md in this directory for the full manual walkthrough this automates.
+
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: apy_gateway
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 2s
+      retries: 30
+
+  minio:
+    image: minio/minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  backend:
+    image: python:3-alpine
+    command: sh -c "echo 'hello from backend' > /tmp/index.html && cd /tmp && python3 -m http.server 80"
+
+  agent:
+    build:
+      context: ../../..
+      dockerfile: nginx/Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: apy_gateway
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      DB_SSL_MODE: disabled
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_BUCKET: apy-gateway-certs
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_FORCE_PATH_STYLE: "true"
+      REDIS_URL: redis://redis:6379/
+      HEARTBEAT_INTERVAL_SECS: "5"
+      HEARTBEAT_TTL_SECS: "15"
+      RECONCILIATION_INTERVAL_SECS: "15"
+      AGENT_HOSTNAME: integration-test-replica
+      RUST_LOG: info
+    ports:
+      - "18080:80"
+      - "18443:443"
