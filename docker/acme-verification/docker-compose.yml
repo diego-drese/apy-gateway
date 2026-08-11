@@ -1,0 +1,201 @@
+# End-to-end verification harness for Fase 9 (ACME/Let's Encrypt automatic issuance, SPEC.md
+# §11). Unlike agent/tests/integration/ (agent-focused — a throwaway migrate container is enough
+# there), this harness runs the REAL control-plane app + queue worker, since Fase 9's issuance and
+# renewal logic lives entirely in Laravel. Pebble (the ACME test server letsencrypt/pebble itself
+# ships) stands in for Let's Encrypt — it performs REAL HTTP-01 validation over the compose
+# network against the real apy-gateway-nginx image. Never set PEBBLE_VA_ALWAYS_VALID here — that
+# would skip validation entirely and defeat the point of this harness.
+# See README.md in this directory for the full manual walkthrough this automates.
+
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: apy_gateway
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 2s
+      retries: 30
+
+  minio:
+    image: minio/minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      retries: 30
+
+  backend:
+    image: python:3-alpine
+    command: sh -c "echo 'hello from acme-verification backend' > /tmp/index.html && cd /tmp && python3 -m http.server 80"
+
+  # Real ACME v2 (RFC 8555) test server, not a stub — same protocol implementation family as
+  # Boulder (the real Let's Encrypt CA software), just miniature. httpPort remapped from its
+  # default 5002 to 80 (pebble/pebble-config.json) to match a real Nginx deployment; everything
+  # else in that file is copied verbatim from Pebble's own upstream default config.
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    command: ["-config", "/pebble-config.json"]
+    environment:
+      # Empirically confirmed via Pebble's source (va/va.go, wfe/wfe.go), not assumed:
+      PEBBLE_VA_NOSLEEP: "1" # removes an artificial validation delay, faster iteration only
+      PEBBLE_WFE_NONCEREJECT: "0" # default is 5% — disabled for harness determinism
+      PEBBLE_AUTHZREUSE: "0" # default is 50% — disabled so every run exercises a fresh authorization
+    volumes:
+      - ./pebble/pebble-config.json:/pebble-config.json:ro
+    ports:
+      - "14000:14000"
+      - "15000:15000"
+
+  # See acme-directory-proxy.conf — fixes one hardcoded path mismatch between the ACME client
+  # library and Pebble specifically; not needed against real Let's Encrypt in production.
+  acme-directory-proxy:
+    image: nginx:alpine
+    depends_on:
+      - pebble
+    volumes:
+      - ./acme-directory-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./pebble/pebble.minica.pem:/etc/nginx/pebble.minica.pem:ro
+
+  agent:
+    build:
+      context: ../..
+      dockerfile: nginx/Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Not just "mysql healthy" — mysql being reachable doesn't mean the schema exists yet.
+      # Confirmed empirically: without this, the agent boots before control-plane's `php artisan
+      # migrate` runs, hits "Table 'proxy_hosts' doesn't exist", and exits immediately (fail-fast,
+      # no retry — SPEC.md §9.1 has no "wait for schema" step, by design). Waiting for
+      # control-plane's own healthcheck (which only passes after migrations complete) fixes this.
+      control-plane:
+        condition: service_healthy
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: apy_gateway
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      DB_SSL_MODE: disabled
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_BUCKET: apy-gateway-certs
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_FORCE_PATH_STYLE: "true"
+      REDIS_URL: redis://redis:6379/
+      HEARTBEAT_INTERVAL_SECS: "5"
+      HEARTBEAT_TTL_SECS: "15"
+      RECONCILIATION_INTERVAL_SECS: "15"
+      AGENT_HOSTNAME: acme-verification-replica
+      RUST_LOG: info
+    networks:
+      # Compose's embedded DNS already resolves plain service names automatically; this alias
+      # exists so the ACME test domain looks like a real domain rather than a bare service name,
+      # and so Pebble's real (not faked) DNS lookup resolves it to this container.
+      default:
+        aliases:
+          - acme-test.local
+    ports:
+      - "18080:80"
+      - "18443:443"
+
+  # No apps/control-plane/Dockerfile exists yet (Fase 11's job) — generic image + volume mount of
+  # the real app code, same throwaway-container philosophy agent/tests/integration/README.md
+  # already uses for its one-off migrate step, just kept running here since Fase 9's issuance
+  # logic needs the app (and a queue worker) actually alive, not one-shot.
+  control-plane: &control_plane
+    image: php:8.3-cli
+    working_dir: /app
+    volumes:
+      - ../../apps/control-plane:/app
+      - ./pebble/pebble.minica.pem:/usr/local/share/ca-certificates/pebble.minica.crt:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pebble:
+        condition: service_started
+      acme-directory-proxy:
+        condition: service_started
+    environment: &control_plane_env
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_KEY: base64:8vRgXKZ3xY7wJ9qN2mP5tL0cF4hB6nS1eD8aG3iU7oQ=
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: apy_gateway
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      QUEUE_CONNECTION: redis
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_REGION: us-east-1
+      MINIO_BUCKET: apy-gateway-certs
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_FORCE_PATH_STYLE: "true"
+      MINIO_SSE_ENABLED: "false"
+      # Real Pebble directory, never Let's Encrypt itself — routed through acme-directory-proxy
+      # (see acme-directory-proxy.conf) since the ACME client library hardcodes "/directory",
+      # while Pebble's own endpoint is "/dir". Every request past the first goes straight to
+      # Pebble over HTTPS; `pebble.minica.pem` is trusted via the container's system CA store
+      # below (update-ca-certificates) — TLS verification is never disabled to make this work.
+      ACME_BASE_URL: http://acme-directory-proxy:8080
+      ACME_ACCOUNT_KEY_STORAGE_PATH: acme/account-key.pem
+      ACME_CHALLENGE_PROPAGATION_DELAY_SECONDS: "3"
+      ACME_POLL_MAX_ATTEMPTS: "10"
+      ACME_POLL_INTERVAL_SECONDS: "2"
+      MAIL_MAILER: log
+      SESSION_DRIVER: array
+      CACHE_STORE: array
+    command: >
+      bash -c "
+        update-ca-certificates &&
+        docker-php-ext-install -j$(nproc) pdo_mysql >/dev/null &&
+        php artisan migrate --force &&
+        php -S 0.0.0.0:8000 -t public
+      "
+    ports:
+      - "18000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/up"]
+      interval: 3s
+      retries: 60
+      start_period: 60s
+
+  queue-worker:
+    <<: *control_plane
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    command: >
+      bash -c "
+        update-ca-certificates &&
+        docker-php-ext-install -j$(nproc) pdo_mysql >/dev/null &&
+        php artisan queue:work --tries=3
+      "
+    ports: []
+    healthcheck:
+      disable: true

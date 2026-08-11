@@ -1,0 +1,53 @@
+{# Rendered by apy-agent. Do not edit by hand — regenerated on every sync. Domain: {{ domain }} #}
+{% if ssl %}
+server {
+    listen 80;
+    server_name {{ domain }};
+
+    include /etc/nginx/snippets/acme-challenge.conf;
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl;
+    server_name {{ domain }};
+
+    ssl_certificate     {{ ssl.crt_path }};
+    ssl_certificate_key {{ ssl.key_path }};
+    include /etc/nginx/snippets/ssl-common.conf;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    location / {
+        proxy_pass {{ forward_scheme }}://{{ forward_host }}:{{ forward_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+{% if websockets_enabled %}
+        include /etc/nginx/snippets/websocket.conf;
+{% endif %}
+    }
+}
+{% else %}
+server {
+    listen 80;
+    server_name {{ domain }};
+
+    include /etc/nginx/snippets/acme-challenge.conf;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    location / {
+        proxy_pass {{ forward_scheme }}://{{ forward_host }}:{{ forward_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+{% if websockets_enabled %}
+        include /etc/nginx/snippets/websocket.conf;
+{% endif %}
+    }
+}
+{% endif %}
