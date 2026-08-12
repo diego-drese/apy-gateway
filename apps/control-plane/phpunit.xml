@@ -24,6 +24,10 @@
              to be a non-null string, and CI has no .env to source one from. -->
         <env name="APP_KEY" value="base64:hpLfH2RZJo3FVlkQzXU2QvRi0udkVO56a+tDLBtsfE0="/>
         <env name="APP_MAINTENANCE_DRIVER" value="file"/>
+        <!-- RequestIpAccessAction sends the approval link here; IpAccessRequestTest asserts on
+             it via hasTo(). Without it, config('security.admin_notification_email') is null in
+             CI (no .env), so the mail's "to" never matches and assertQueued() fails. -->
+        <env name="ADMIN_NOTIFICATION_EMAIL" value="admin@example.com"/>
         <env name="BCRYPT_ROUNDS" value="4"/>
         <env name="BROADCAST_CONNECTION" value="null"/>
         <env name="CACHE_STORE" value="array"/>
