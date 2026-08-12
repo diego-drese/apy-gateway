@@ -44,6 +44,53 @@ mudou e o que falta.
     configuração pra ele em vez de subir os containers bundled (SPEC.md §13.3).
 
 ### Implementado
+- **Fase 11 — Ambiente Docker completo** (SPEC.md §13, §14): `docker compose up` (via
+  `./scripts/install.sh`) sobe o ambiente de dev inteiro com um único comando — control-plane
+  (web/queue/scheduler), MySQL, Redis, MinIO (+ `minio-init` criando o bucket idempotentemente),
+  Mailpit e uma réplica real `agent+nginx`, todos com healthcheck real (não só "container up").
+  **Verificado de ponta a ponta neste ambiente** (não simulado): `./scripts/install.sh` do zero
+  ficou com todos os serviços `healthy`, `gateway:bootstrap-admin` liberou o IP e criou o admin,
+  `./scripts/healthcheck.sh` confirmou os 5 serviços expostos, e a réplica `agent+nginx` respondeu
+  com o catch-all `444` documentado em `nginx.conf` (zero `proxy_hosts` configurados ainda — não é
+  falha, é o comportamento esperado de instalação nova).
+  **`apps/control-plane/Dockerfile` novo** (não existia antes): multi-stage (`composer:2` pra
+  vendor, depois `dunglas/frankenphp:1-php8.3`) — uma imagem só, vários papéis
+  (web/queue/scheduler/migrate) definidos por `docker/entrypoint.sh`, cada papel um serviço
+  diferente no compose, nenhum supervisor de processo necessário (FrankenPHP é um binário só pro
+  papel web; os outros já são comandos Artisan de processo único). Deliberadamente sem
+  `config:cache`/`route:cache` no build — cachear `env()` em build time quebraria o mesmo binário
+  rodando com env diferente por deploy (SPEC.md §13.3). `nginx/Dockerfile` (multi-stage
+  agent+nginx) já existia desde a Fase 5 — não precisou de nenhuma mudança, só ligar no compose.
+  **`gateway:bootstrap-admin` novo** (`BootstrapAdminCommand`): sem ele, `docker compose up -d`
+  deixava a aplicação rodando sem ninguém conseguir logar — a UI da Fase 8 não tem
+  auto-registro, e `CreateUserAction` exige um ator autenticado existente (não serve pro primeiro
+  usuário do zero). Idempotente (roda em todo `install.sh`, não só na primeira vez): sempre
+  garante o IP na allowlist (útil quando o IP observado pelo container difere de `127.0.0.1` —
+  confirmado empiricamente que o NAT do Docker Desktop pra Mac apresenta esse tráfego com um
+  gateway próprio, não o loopback real do host) e só cria o admin se nenhum usuário existir ainda,
+  reaproveitando o fluxo de senha via link de reset (nunca senha direta), igual a
+  `CreateUserAction`. Rota `GET /_install/whoami` nova em `web.php`, deliberadamente fora do
+  `ip.allowlist` (mesmo racional de `/auth/ip-requests`) — só existe pra deixar o `install.sh`
+  descobrir qual IP o app realmente enxerga antes de qualquer coisa estar liberada; não vaza nada
+  além do próprio IP do chamador.
+  **`.github/workflows/main.yml` reescrito** (SPEC.md §14): parava de buildar um `Dockerfile` na
+  raiz que não existia; agora dois jobs de build separados (`build-control-plane`,
+  `build-nginx`), cada um com contexto/Dockerfile próprio, `docker/metadata-action` computando as
+  tags (`latest` só em push, `sha` curto sempre, semver quando a tag `vX.Y.Z` existir). Build
+  roda em PR contra `main` (só valida que builda, sem publicar) e em push a `main`/tag `v*.*.*`
+  (publica de verdade); `homolog` e demais branches só rodam os testes (`test-control-plane`,
+  `test-agent`), nunca build/publish de imagem.
+  **`.gitignore` corrigido**: `/.env` (raiz) não estava listado — só as variações dentro de
+  `apps/control-plane/` estavam. Sem essa entrada, o `.env` real gerado por `install.sh` (com
+  `APP_KEY`, credenciais do MinIO) ficaria só "não rastreado", um `git add -A` descuidado
+  commitaria segredo de verdade (CLAUDE.md §Segurança: "Secrets never belong in the repository").
+  `LICENSE` (MIT) adicionado — estava vazio (`e69de29`) desde o primeiro commit.
+  `examples/docker-compose.yml`, `examples/.env.example`, `examples/cluster-example.yml`,
+  `scripts/install.sh`/`update.sh`/`healthcheck.sh` implementados (eram placeholders vazios desde
+  o início do projeto, listados em "Pendente / não iniciado"). `cluster-example.yml` usa a
+  imagem **publicada** (`diegoneumann/apy-gateway-nginx:latest`), não builda nada — é o exemplo
+  pra subir uma réplica de borda numa máquina separada do núcleo (SPEC.md §13.1), diferente do
+  `docker-compose.yml` de dev, que builda tudo local.
 - **Fase 10 — Observabilidade** (SPEC.md §12): duas metades, ambas fechadas nesta fase — logs
   centralizados via encaminhamento **opt-in** (decisão do usuário: quem não quiser centralizar
   continua acessando log local de cada réplica, sem mudança nenhuma de comportamento) e métricas
@@ -415,8 +462,7 @@ mudou e o que falta.
   separados. Até lá, o workflow fica como está — não implementar o build ainda.
 
 ### Pendente / não iniciado
-Tudo abaixo ainda não tem código — apenas placeholders vazios no repositório:
-`scripts/*.sh`, `examples/*.yml`, `examples/.env.example`, `docker/`, `apps/docs/`.
+`apps/docs/` ainda não tem código — placeholder vazio no repositório.
 
 ## Próximos passos (roadmap)
 
@@ -444,14 +490,7 @@ a filosofia de mudanças pequenas e verificáveis do projeto.
 - [x] **Fase 9 — Emissão automática via ACME/Let's Encrypt (HTTP-01)** ✅ concluída — ver
   "Implementado" acima.
 - [x] **Fase 10 — Observabilidade** ✅ concluída — ver "Implementado" acima.
-
-- [ ] **Fase 11 — Ambiente Docker completo**
-  `docker-compose.yml` de desenvolvimento (control-plane, MySQL, Redis, MinIO, Mailpit,
-  ao menos 1 réplica agent+nginx) subindo com um único comando; `examples/` atualizado;
-  scripts de instalação/atualização/healthcheck implementados; `apps/control-plane/Dockerfile`
-  criado. `nginx/Dockerfile` multi-stage **já existe e builda** (Fase 5) — falta só ligar no
-  `docker-compose.yml`/CI; então reescrever `.github/workflows/main.yml` para buildar/publicar
-  `apy-gateway-control-plane` e `apy-gateway-nginx` (SPEC.md §14).
+- [x] **Fase 11 — Ambiente Docker completo** ✅ concluída — ver "Implementado" acima.
 
 ## [0.0.0] - Estado inicial
 

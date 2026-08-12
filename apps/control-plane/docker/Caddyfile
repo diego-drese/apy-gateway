@@ -1,0 +1,13 @@
+# Trimmed down from FrankenPHP's own default (/etc/frankenphp/Caddyfile in the base image),
+# committed explicitly rather than relying on the image's baked-in default (CLAUDE.md: explicit
+# over magic) — kept in version control so it doesn't silently drift across FrankenPHP versions.
+{
+	skip_install_trust
+	frankenphp
+}
+
+{$SERVER_NAME:localhost} {
+	root {$SERVER_ROOT:public/}
+	encode zstd br gzip
+	php_server
+}

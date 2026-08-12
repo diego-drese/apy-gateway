@@ -93,16 +93,19 @@ O que já foi implementado e os próximos passos estão em **[CHANGELOG.md](./CH
 
 ## Como rodar localmente
 
-> ⚠️ O ambiente Docker completo ainda está em construção (ver status em
-> [CHANGELOG.md](./CHANGELOG.md)). O objetivo final é que um novo desenvolvedor consiga subir
-> tudo — control-plane, MySQL, Redis, MinIO e ao menos uma réplica de agent+nginx — com:
->
-> ```bash
-> docker compose up -d
-> ```
->
-> Nenhuma dependência (PHP, MySQL, Redis, Nginx) deve precisar ser instalada manualmente na
-> máquina do desenvolvedor.
+Nenhuma dependência (PHP, MySQL, Redis, Nginx) precisa ser instalada manualmente na máquina do
+desenvolvedor — tudo sobe via Docker com um único comando:
+
+```bash
+./scripts/install.sh
+```
+
+Isso sobe o ambiente completo (`examples/docker-compose.yml`): control-plane (web + queue +
+scheduler), MySQL, Redis, MinIO, Mailpit e uma réplica real de agent+nginx; gera o `.env` a
+partir de `examples/.env.example` na primeira execução; espera todos os serviços ficarem
+saudáveis; e libera `127.0.0.1` + cria o primeiro usuário admin (link de senha via Mailpit em
+http://localhost:8025). `./scripts/update.sh` reconstrói as imagens após mudanças de código;
+`./scripts/healthcheck.sh` confirma que cada serviço está respondendo de verdade.
 
 ## Status
 

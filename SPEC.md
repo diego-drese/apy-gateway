@@ -358,11 +358,14 @@ MySQL, Redis e MinIO usam imagens oficiais do Docker Hub (`mysql`, `redis`, `min
 não construímos nem publicamos imagens próprias para eles, apenas os referenciamos no
 `docker-compose.yml` com a configuração via variáveis de ambiente/volumes.
 
-O workflow de CI (`.github/workflows/main.yml`) hoje builda uma única imagem genérica a
-partir de um `Dockerfile` na raiz que não existe — isso será reescrito para buildar e
-publicar `apy-gateway-control-plane` e `apy-gateway-nginx` como jobs separados, **somente
-depois que os respectivos Dockerfiles estiverem prontos** (Fase 10 do roadmap, ver
-CHANGELOG.md). Até lá, o workflow atual fica como está, sem uso real.
+O workflow de CI (`.github/workflows/main.yml`, reescrito na Fase 11) builda e publica
+`apy-gateway-control-plane` e `apy-gateway-nginx` como jobs separados, cada um com seu
+próprio contexto/Dockerfile — nunca uma imagem monolítica. Testes (`test-control-plane`,
+`test-agent`) rodam em todo push de qualquer branch e todo PR contra `main`, pegando
+regressão cedo. Build roda em três situações: PR contra `main` (só valida que a imagem
+builda, nunca publica), push em `main` (builda e publica, incluindo a tag `latest`) e push
+de tag `vX.Y.Z` (builda e publica com a tag semver correspondente, sem `latest`). `homolog`
+nunca publica imagem — só roda os testes, como qualquer outra branch.
 
 ## 15. Segurança
 

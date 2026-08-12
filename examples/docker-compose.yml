@@ -1,0 +1,203 @@
+# Fase 11 (SPEC.md §13) — ambiente de desenvolvimento oficial. Sobe com um comando:
+#   ./scripts/install.sh
+# (que por baixo é `docker compose -f examples/docker-compose.yml --env-file .env up -d --build`
+# + espera de saúde + bootstrap do primeiro admin — ver scripts/install.sh).
+#
+# Pebble (ACME) e o receptor rsyslog ficam de fora de propósito — continuam só nos harnesses de
+# verificação dedicados (docker/acme-verification/, docker/observability-verification/), pra não
+# duplicar config que já existe lá com risco real de desalinhar ao longo do tempo.
+
+services:
+  mysql:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-root}
+      MYSQL_DATABASE: ${DB_DATABASE:-apy_gateway}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-u${DB_USERNAME:-root}", "-p${DB_PASSWORD:-root}"]
+      interval: 3s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      retries: 30
+
+  minio:
+    image: minio/minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    ports:
+      - "9000:9000"
+      - "19001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      retries: 30
+
+  # One-shot: creates the bucket idempotently. Every prior verification harness paid this cost as
+  # a manual documented step — a real "single command" dev environment can't leave that manual.
+  minio-init:
+    image: minio/mc
+    entrypoint: sh
+    command:
+      - -c
+      - |
+        mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-minioadmin} ${MINIO_SECRET_KEY:-minioadmin} &&
+        mc mb --ignore-existing local/${MINIO_BUCKET:-apy-gateway-certs}
+    depends_on:
+      minio:
+        condition: service_healthy
+
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "8025:8025"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8025/api/v1/info"]
+      interval: 3s
+      retries: 30
+
+  backend:
+    image: python:3-alpine
+    command: sh -c "echo 'hello from apy-gateway dev backend' > /tmp/index.html && cd /tmp && python3 -m http.server 80"
+
+  migrate:
+    build:
+      context: ../apps/control-plane
+      dockerfile: Dockerfile
+    command: ["migrate"]
+    environment: &control_plane_env
+      APP_KEY: ${APP_KEY}
+      APP_ENV: local
+      DB_CONNECTION: mysql
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: ${DB_DATABASE:-apy_gateway}
+      DB_USERNAME: ${DB_USERNAME:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-root}
+      SESSION_DRIVER: database
+      CACHE_STORE: database
+      QUEUE_CONNECTION: redis
+      REDIS_CLIENT: predis
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      MAIL_MAILER: smtp
+      MAIL_HOST: mailpit
+      MAIL_PORT: "1025"
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_REGION: us-east-1
+      MINIO_BUCKET: ${MINIO_BUCKET:-apy-gateway-certs}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_FORCE_PATH_STYLE: "true"
+      MINIO_SSE_ENABLED: "false"
+      ACME_BASE_URL: ${ACME_BASE_URL:-https://acme-v02.api.letsencrypt.org}
+      ACME_ACCOUNT_KEY_STORAGE_PATH: acme/account-key.pem
+      ACME_RENEWAL_THRESHOLD_DAYS: "30"
+      ACME_CHALLENGE_PROPAGATION_DELAY_SECONDS: "3"
+      ACME_POLL_MAX_ATTEMPTS: "10"
+      ACME_POLL_INTERVAL_SECONDS: "3"
+    healthcheck:
+      disable: true
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  control-plane:
+    build:
+      context: ../apps/control-plane
+      dockerfile: Dockerfile
+    command: ["web"]
+    environment: *control_plane_env
+    ports:
+      - "8000:80"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/up"]
+      interval: 3s
+      retries: 30
+      start_period: 15s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+
+  queue-worker:
+    build:
+      context: ../apps/control-plane
+      dockerfile: Dockerfile
+    command: ["queue"]
+    environment: *control_plane_env
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    build:
+      context: ../apps/control-plane
+      dockerfile: Dockerfile
+    command: ["scheduler"]
+    environment: *control_plane_env
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Real replica — reuses nginx/Dockerfile unchanged, same image every verification harness
+  # already builds and proves (Fases 5-10). Waits on control-plane's own healthcheck, not just
+  # MySQL — a real race found and fixed in Fase 10 (agent booting before the schema existed).
+  agent:
+    build:
+      context: ..
+      dockerfile: nginx/Dockerfile
+    environment:
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: ${DB_DATABASE:-apy_gateway}
+      DB_USERNAME: ${DB_USERNAME:-root}
+      DB_PASSWORD: ${DB_PASSWORD:-root}
+      DB_SSL_MODE: disabled
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_BUCKET: ${MINIO_BUCKET:-apy-gateway-certs}
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+      MINIO_FORCE_PATH_STYLE: "true"
+      REDIS_URL: redis://redis:6379/
+      HEARTBEAT_INTERVAL_SECS: "15"
+      HEARTBEAT_TTL_SECS: "45"
+      RECONCILIATION_INTERVAL_SECS: "60"
+      AGENT_HOSTNAME: dev-replica-1
+      RUST_LOG: info
+      LOG_FORWARDING_ENABLED: "false"
+    ports:
+      - "8080:80"
+      - "8443:443"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      control-plane:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+  minio-data:

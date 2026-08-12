@@ -1,0 +1,44 @@
+# Fase 11 (SPEC.md §13.1) — réplica de borda extra, pra copiar numa máquina separada do núcleo
+# (control-plane/MySQL/Redis/MinIO continuam fixos, essa réplica é efêmera e sem estado local).
+# Diferente de examples/docker-compose.yml (ambiente de dev, builda tudo local, tudo na mesma
+# máquina, nomes de serviço do Compose como hostname): aqui a imagem é a PUBLICADA pelo CI
+# (.github/workflows/main.yml), não builda nada — uma réplica de borda não precisa do monorepo
+# nem de toolchain Rust — e os endereços abaixo apontam pro núcleo de verdade, não nomes de
+# serviço locais.
+#
+# Uso:
+#   cp examples/cluster-example.yml docker-compose.yml
+#   # edite as variáveis abaixo (ou copie examples/.env.example e ajuste pros endereços reais)
+#   docker compose up -d
+
+services:
+  agent:
+    image: diegoneumann/apy-gateway-nginx:latest
+    environment:
+      DB_HOST: ${CORE_DB_HOST:?defina o host real do MySQL do núcleo}
+      DB_PORT: ${CORE_DB_PORT:-3306}
+      DB_DATABASE: ${CORE_DB_DATABASE:-apy_gateway}
+      DB_USERNAME: ${CORE_DB_USERNAME:?defina a credencial SELECT-only do agent (SPEC.md §9.4)}
+      DB_PASSWORD: ${CORE_DB_PASSWORD:?defina a credencial SELECT-only do agent (SPEC.md §9.4)}
+      DB_SSL_MODE: ${CORE_DB_SSL_MODE:-preferred}
+      MINIO_ENDPOINT_URL: ${CORE_MINIO_ENDPOINT_URL:?defina o endereço real do MinIO do núcleo}
+      MINIO_BUCKET: ${CORE_MINIO_BUCKET:-apy-gateway-certs}
+      MINIO_ACCESS_KEY: ${CORE_MINIO_ACCESS_KEY:?defina a credencial escopada do agent (SPEC.md §9.4)}
+      MINIO_SECRET_KEY: ${CORE_MINIO_SECRET_KEY:?defina a credencial escopada do agent (SPEC.md §9.4)}
+      MINIO_FORCE_PATH_STYLE: "true"
+      REDIS_URL: ${CORE_REDIS_URL:?defina redis://host:porta/ do núcleo}
+      AGENT_HOSTNAME: ${AGENT_HOSTNAME:?defina um hostname único pra essa réplica}
+      HEARTBEAT_INTERVAL_SECS: "15"
+      HEARTBEAT_TTL_SECS: "45"
+      RECONCILIATION_INTERVAL_SECS: "300"
+      RUST_LOG: info
+      # SPEC.md §12 — opt-in, desligado por padrão. Ver docker/observability-verification/
+      # pra testar contra um receptor real antes de ligar em produção.
+      LOG_FORWARDING_ENABLED: "false"
+      # LOG_FORWARDING_ENABLED: "true"
+      # CENTRAL_LOG_SERVER_HOST: ${CENTRAL_LOG_SERVER_HOST}
+      # CENTRAL_LOG_SERVER_PORT: "514"
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
