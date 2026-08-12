@@ -22,6 +22,7 @@ RUN mkdir -p /etc/nginx/conf.d /var/lib/apy-agent/certs /var/run/apy-agent \
 
 ENV NGINX_CONF_PATH=/etc/nginx/nginx.conf \
     NGINX_CONF_D_PATH=/etc/nginx/conf.d \
+    NGINX_SNIPPETS_DIR=/etc/nginx/snippets \
     NGINX_TEMPLATES_DIR=/etc/apy-agent/templates \
     STATE_FILE_PATH=/var/lib/apy-agent/state.json \
     CERT_STORAGE_DIR=/var/lib/apy-agent/certs \

@@ -20,6 +20,10 @@ impl AppContext {
             .with_context(|| format!("creating {}", config.cert_storage_dir.display()))?;
         std::fs::create_dir_all(&config.acme_challenge_dir)
             .with_context(|| format!("creating {}", config.acme_challenge_dir.display()))?;
+        // Fase 10 (SPEC.md §12): rendered once here, before Nginx ever spawns (main.rs), since
+        // nginx.conf's `include` line needs the file to already exist. Changing the log
+        // destination is a redeploy-time decision, same tier as DB credentials — no live-reload.
+        crate::logging_config::write_snippet(&config.nginx_snippets_dir, &config.log_destination)?;
         if let Some(p) = config.state_file_path.parent() {
             std::fs::create_dir_all(p).with_context(|| format!("creating {}", p.display()))?;
         }

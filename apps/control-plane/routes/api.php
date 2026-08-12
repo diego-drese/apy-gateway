@@ -6,6 +6,7 @@ use App\Http\Controllers\CertificateController;
 use App\Http\Controllers\IpAccessRequestController;
 use App\Http\Controllers\IpAllowlistController;
 use App\Http\Controllers\ProxyHostController;
+use App\Http\Controllers\ReplicaController;
 use App\Http\Controllers\UserController;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
@@ -33,4 +34,6 @@ Route::middleware(['auth:sanctum', 'ip.allowlist'])->group(function () {
     Route::get('/ip-access-requests', [IpAccessRequestController::class, 'index'])->name('ip-access-requests.index');
     Route::post('/ip-access-requests/{ip_access_request}/approve', [IpAccessRequestController::class, 'approve'])
         ->name('ip-access-requests.approve');
+
+    Route::get('/replicas', [ReplicaController::class, 'index'])->name('replicas.index');
 });

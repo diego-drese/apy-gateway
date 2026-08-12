@@ -145,6 +145,30 @@ pub fn reload(binary_path: &str, main_conf_path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Runs `nginx -v` and extracts the version string for the heartbeat payload (Fase 10, SPEC.md
+/// §12) — read once at boot (the version is invariant for a container's lifetime), not on every
+/// heartbeat tick, and never fatal to boot if it fails (returns the raw error up to the caller,
+/// which is expected to log-and-default rather than abort).
+pub fn detect_version(binary_path: &str) -> anyhow::Result<String> {
+    let out = std::process::Command::new(binary_path)
+        .arg("-v")
+        .output()
+        .context("failed to invoke nginx -v")?;
+
+    // nginx writes "nginx version: nginx/X.Y.Z" to stderr, not stdout.
+    let raw = String::from_utf8_lossy(&out.stderr);
+    parse_version_output(&raw).ok_or_else(|| anyhow::anyhow!("could not parse nginx -v output: {raw:?}"))
+}
+
+/// Pure so it's testable against fixture strings without a real `nginx` binary. Expects the real
+/// `nginx -v` shape ("nginx version: nginx/1.27.4") — anything without a "nginx/" marker is
+/// treated as unparseable rather than guessed at.
+pub fn parse_version_output(raw: &str) -> Option<String> {
+    let version = raw.trim().rsplit_once("nginx/")?.1;
+
+    Some(version.to_string()).filter(|v| !v.is_empty())
+}
+
 pub async fn wait_until_serving(
     addr: &str,
     timeout: std::time::Duration,
@@ -245,5 +269,27 @@ mod tests {
     fn remove_missing_domain_is_a_no_op() {
         let dir = unique_temp_dir("remove-missing");
         remove_domain_config(&dir, "example.com", &AlwaysOk).unwrap();
+    }
+
+    #[test]
+    fn parse_version_output_extracts_version_from_real_nginx_v_shape() {
+        assert_eq!(
+            parse_version_output("nginx version: nginx/1.27.4\n"),
+            Some("1.27.4".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_version_output_handles_build_suffix() {
+        assert_eq!(
+            parse_version_output("nginx version: nginx/1.27.4 (Ubuntu)\n"),
+            Some("1.27.4 (Ubuntu)".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_version_output_rejects_unrecognized_input() {
+        assert_eq!(parse_version_output("not nginx output"), None);
+        assert_eq!(parse_version_output(""), None);
     }
 }

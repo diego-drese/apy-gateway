@@ -1,35 +1,116 @@
-name: Build and Deploy Docker Image
+name: CI
 
+# Testes rodam em todo push de qualquer branch (inclusive homolog) + todo PR contra main — pega
+# regressão cedo em qualquer branch, não só em main. Build/publish das imagens só roda em PR
+# (validação, sem push pro registry) ou push em main/tag `vX.Y.Z` (publica de verdade) — ver o
+# `if:` de cada job de build. homolog nunca publica imagem.
 on:
+  pull_request:
+    branches: [main]
   push:
-    branches:
-      - AJUSTAR  # ou a branch que você quiser usar
+    # Especificar só `tags:` faria o push de QUALQUER branch parar de disparar o workflow
+    # (comportamento real e documentado do GitHub Actions, não aditivo) — `branches: ["**"]`
+    # aqui é o que garante que testes continuem rodando em toda branch, homolog inclusive.
+    branches: ["**"]
+    tags: ["v*.*.*"]
+
 jobs:
-  build-deploy:
+  test-control-plane:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/control-plane
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: mbstring, pdo, pdo_sqlite, sqlite3, curl, openssl, dom, fileinfo, xml
+          coverage: none
+      - name: Install Composer dependencies
+        run: composer install --prefer-dist --no-progress --no-interaction
+      - name: Run tests
+        run: php artisan test
+
+  test-agent:
     runs-on: ubuntu-latest
     steps:
-      - name: 📥 Checkout do código
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run tests
+        working-directory: agent
+        run: cargo test
 
-      - name: 🔧 Configurar Docker Buildx
-        uses: docker/setup-buildx-action@v3
+  # SPEC.md §14: as duas imagens do projeto são publicadas separadamente, nunca uma imagem
+  # monolítica — cada uma com o próprio job, contexto e Dockerfile.
+  build-control-plane:
+    needs: test-control-plane
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
-      - name: 🔐 Login no DockerHub
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: diegoneumann/apy-gateway-control-plane
+          tags: |
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=sha,format=short
+            type=semver,pattern={{version}}
+
+      - name: Login to DockerHub
+        if: github.event_name == 'push'
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}
 
-      - name: 🏗️ Build e Push da imagem Docker
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
-            context: .
-            file: ./Dockerfile
-            push: true
-            platforms: linux/amd64
-            tags: diegoneumann/apy-gateway:latest
-            cache-from: type=registry,ref=diegoneumann/apy-gateway:cache
-            cache-to: type=registry,ref=diegoneumann/apy-gateway:cache,mode=max
+          context: apps/control-plane
+          file: apps/control-plane/Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=control-plane
+          cache-to: type=gha,mode=max,scope=control-plane
 
+  build-nginx:
+    needs: test-agent
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
 
+      - name: Compute image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: diegoneumann/apy-gateway-nginx
+          tags: |
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+            type=sha,format=short
+            type=semver,pattern={{version}}
 
+      - name: Login to DockerHub
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: nginx/Dockerfile
+          push: ${{ github.event_name == 'push' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=nginx
+          cache-to: type=gha,mode=max,scope=nginx
