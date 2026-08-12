@@ -19,6 +19,10 @@
     </source>
     <php>
         <env name="APP_ENV" value="testing"/>
+        <!-- Test-only key, never used outside the throwaway :memory: sqlite DB above. Needed
+             because PasswordBrokerManager (Password::sendResetLink) requires config('app.key')
+             to be a non-null string, and CI has no .env to source one from. -->
+        <env name="APP_KEY" value="base64:hpLfH2RZJo3FVlkQzXU2QvRi0udkVO56a+tDLBtsfE0="/>
         <env name="APP_MAINTENANCE_DRIVER" value="file"/>
         <env name="BCRYPT_ROUNDS" value="4"/>
         <env name="BROADCAST_CONNECTION" value="null"/>
