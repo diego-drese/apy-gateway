@@ -28,6 +28,7 @@ class ReplicaAgentFactory extends Factory
             'agent_version' => '0.1.0',
             'nginx_version' => '1.27.0',
             'status' => ReplicaAgentStatus::Online,
+            'synced_domains_count' => fake()->numberBetween(0, 20),
             'last_heartbeat_at' => now(),
         ];
     }

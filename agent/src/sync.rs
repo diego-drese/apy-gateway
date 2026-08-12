@@ -15,6 +15,10 @@ pub struct SyncOutcome {
     pub applied: Vec<String>,
     pub failed: Vec<(String, String)>,
     pub removed: Vec<String>,
+    /// Total domains currently applied after this sync — Fase 10 (SPEC.md §12) heartbeat metric.
+    /// Read from final `agent_state` size rather than tracked as a diff, so it's correct even on
+    /// "nothing changed"/"unknown event type" branches with no extra bookkeeping.
+    pub synced_domains_count: usize,
 }
 
 pub async fn run_bootstrap(app: &AppContext) -> anyhow::Result<SyncOutcome> {
@@ -55,6 +59,7 @@ pub async fn run_bootstrap(app: &AppContext) -> anyhow::Result<SyncOutcome> {
         tracing::error!(error = %err, "failed to reconcile ACME challenge files during bootstrap");
     }
 
+    outcome.synced_domains_count = agent_state.domains.len();
     agent_state.save(&app.config.state_file_path)?;
     Ok(outcome)
 }
@@ -117,6 +122,7 @@ pub async fn sync_incremental(app: &AppContext, event: &DomainEvent) -> anyhow::
         }
     }
 
+    outcome.synced_domains_count = agent_state.domains.len();
     agent_state.save(&app.config.state_file_path)?;
     Ok(outcome)
 }

@@ -3,6 +3,8 @@ mod app_context;
 mod config;
 mod db;
 mod event_bus;
+mod local_ip;
+mod logging_config;
 mod minio;
 mod models;
 mod nginx;
@@ -40,6 +42,21 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Fase 10 (SPEC.md §12): both invariant for a container's lifetime, so detected once here
+    // rather than on every heartbeat tick. Neither failure is fatal to boot — the heartbeat is a
+    // best-effort observability aid, never load-bearing for serving traffic.
+    let nginx_version = nginx::detect_version(&app.config.nginx_binary_path).unwrap_or_else(|err| {
+        tracing::warn!(error = %err, "failed to detect nginx version for heartbeat; reporting \"unknown\"");
+        "unknown".to_string()
+    });
+    let local_ip = local_ip::detect_local_ip(&format!("{}:{}", app.config.db.host, app.config.db.port))
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "failed to self-detect local IP for heartbeat; reporting \"0.0.0.0\"");
+            "0.0.0.0".to_string()
+        });
+    let (domain_count_tx, domain_count_rx) = tokio::sync::watch::channel(outcome.synced_domains_count);
+
     let mut nginx_child = nginx::spawn(&app.config.nginx_binary_path, &app.config.nginx_conf_path)?;
     nginx::wait_until_serving(
         &app.config.readiness_check_addr,
@@ -69,6 +86,9 @@ async fn main() -> anyhow::Result<()> {
         app.config.replica_hostname.clone(),
         app.config.heartbeat_interval,
         app.config.heartbeat_ttl,
+        local_ip,
+        nginx_version,
+        domain_count_rx,
     ));
 
     let mut reconciliation_timer = tokio::time::interval(app.config.reconciliation_interval);
@@ -98,7 +118,8 @@ async fn main() -> anyhow::Result<()> {
                     event_id = %event.id,
                     "received domain event"
                 );
-                match sync::sync_incremental(&app, &event).await {
+                let result = sync::sync_incremental(&app, &event).await;
+                match &result {
                     Ok(outcome) if outcome.applied.is_empty() && outcome.removed.is_empty() => {
                         tracing::debug!(event_id = %event.id, "incremental sync: nothing changed");
                     }
@@ -115,10 +136,14 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Err(err) => tracing::error!(error = %err, event_id = %event.id, "incremental sync failed for event"),
                 }
+                if let Ok(outcome) = result {
+                    let _ = domain_count_tx.send(outcome.synced_domains_count);
+                }
             }
             _ = reconciliation_timer.tick() => {
                 tracing::info!("running periodic full reconciliation");
-                match sync::run_bootstrap(&app).await {
+                let result = sync::run_bootstrap(&app).await;
+                match &result {
                     Ok(outcome) if outcome.applied.is_empty() && outcome.removed.is_empty() => {
                         tracing::debug!("periodic reconciliation: nothing changed");
                     }
@@ -134,6 +159,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(err) => tracing::error!(error = %err, "periodic reconciliation failed"),
+                }
+                if let Ok(outcome) = result {
+                    let _ = domain_count_tx.send(outcome.synced_domains_count);
                 }
             }
         }

@@ -145,7 +145,10 @@ Todas as respostas seguem o padrão de Resources do Laravel (JSON:API-like, cont
 - `GET /api/ip-access-requests`, `POST /api/ip-access-requests/{id}/approve` — aprovação
   autenticada pela UI de solicitações de IP pendentes; distinta do fluxo público por token do
   §6 (duas superfícies de segurança diferentes sobre o mesmo model).
-- `GET /api/replicas` — status das réplicas conhecidas (heartbeat). **Ainda não implementado.**
+- `GET /api/replicas` — status das réplicas conhecidas (paginado): `hostname`, `ip_address`,
+  `agent_version`, `nginx_version`, `status` (`online`/`offline`), `synced_domains_count`
+  (agregado — ver §12), `last_heartbeat_at`. Populado por `replicas:sync-metrics` (Fase 10), nunca
+  escrito diretamente pelo agent (§9.4).
 - `GET /api/audit-logs` — trilha de auditoria (paginada). **Ainda não implementado.**
 
 Controllers apenas validam (Form Requests), autorizam (Policies) e delegam para Actions —
@@ -180,7 +183,13 @@ nenhuma regra de negócio no controller (ver `CLAUDE.md`).
 - Ao receber evento no Redis: repete os passos 2–6 apenas para o domínio afetado (sync incremental, idempotente).
 - Reconciliação completa periódica (ex.: a cada 5 min) como rede de segurança — cobre o caso de a
   réplica ter perdido uma mensagem Redis enquanto estava offline/reiniciando.
-- Heartbeat periódico grava `replica_agents.last_heartbeat_at`.
+- Heartbeat periódico grava um payload JSON (`ts`, `ip`, `agent_version`, `nginx_version`,
+  `synced_domains_count`) em `apy-gateway:replicas:{hostname}:heartbeat` no **Redis**, com TTL —
+  nunca em `replica_agents` diretamente, isso violaria o grant SELECT-only do §9.4. Quem escreve
+  `replica_agents.last_heartbeat_at`/`status`/`synced_domains_count` é o control-plane, via o
+  comando agendado `replicas:sync-metrics` (Fase 10, §12), que lê o Redis periodicamente — a
+  expiração do TTL no Redis (o agent parou de dar heartbeat) é a fonte de verdade pra decidir
+  quando uma réplica vira `offline`, não um relógio separado do lado PHP.
 
 ### 9.3 Idempotência
 Aplicar o mesmo evento/estado múltiplas vezes nunca deve gerar efeito colateral duplicado — o agent
@@ -247,10 +256,26 @@ Estratégia híbrida, conforme decidido:
 
 ## 12. Observabilidade e logs
 
-- Cada réplica de Nginx encaminha access/error log via rsyslog para o Central Log Server.
+- **Encaminhamento de log centralizado é opt-in, desligado por padrão** (Fase 10) — decisão
+  confirmada com o usuário: quem não quer centralizar continua acessando o log de cada réplica
+  localmente (`docker logs`, já funciona hoje via os symlinks pra stdout/stderr da imagem base do
+  Nginx), sem nenhuma mudança de comportamento. Ligado (`LOG_FORWARDING_ENABLED=true` no agent +
+  `CENTRAL_LOG_SERVER_HOST`/`CENTRAL_LOG_SERVER_PORT`), o Nginx passa a usar seu suporte nativo a
+  `access_log syslog:server=...;`/`error_log syslog:server=...;` — **não** um daemon rsyslog local:
+  o agent continua supervisionando só o processo do Nginx, nunca ganha um segundo processo. O
+  "Central Log Server" continua sendo rsyslog (ou compatível) do lado de quem recebe — é só o lado
+  que envia que fica mais simples. Transporte é UDP (nginx não tem cliente syslog TCP/TLS nativo) —
+  sem garantia de entrega, aceitável pro MVP (§16).
 - Logs do control-plane seguem o padrão Laravel (`config/logging.php`), nunca logam segredos
   (senha, chave privada, token de sessão).
-- Métricas mínimas por réplica: última sincronização, versão aplicada por domínio, status do heartbeat.
+- **Métricas por réplica** (Fase 10): heartbeat estruturado (JSON, não só timestamp — ver §9.2)
+  flui do agent pro Redis, e do Redis pro `replica_agents` via o comando agendado
+  `replicas:sync-metrics` (a cada minuto — piso do scheduler do Laravel, então o flip pra
+  `offline` pode atrasar até ~60-100s além do TTL real do heartbeat). Exposto via
+  `GET /api/replicas` (§7). **Simplificação deliberada**: `synced_domains_count` é agregado (total
+  de domínios aplicados com sucesso naquela réplica), não quebrado por domínio — o detalhe por
+  domínio continua só no `state.json` local de cada réplica (efêmero, como já documentado em
+  §13.2), criar uma tabela filha por réplica-domínio seria desproporcional a "métricas mínimas".
 
 ## 13. Ambiente Docker / topologia
 
@@ -360,3 +385,17 @@ CHANGELOG.md). Até lá, o workflow atual fica como está, sem uso real.
 - Rotação/backup da chave de conta ACME (Fase 9, §11): hoje é uma chave RSA de vida longa única,
   gerada uma vez e guardada no MinIO, sem mecanismo de rotação — perdê-la exige registrar uma
   conta ACME nova (não perde certificados já emitidos, só a identidade da conta).
+- Transporte UDP do encaminhamento de log via `syslog:` do Nginx (Fase 9, §12): sem garantia de
+  entrega, sem criptografia em trânsito — aceito como trade-off do MVP já que a feature é opt-in.
+  Upgrade pra um transporte garantido/cifrado exigiria um processo local adicional (o que essa
+  fase decidiu deliberadamente evitar) ou um módulo do Nginx além do core.
+- **Risco real encontrado empiricamente na verificação da Fase 10** (não hipotético — reproduzido
+  de verdade, ver `docker/observability-verification/README.md`): o Nginx resolve o hostname do
+  `CENTRAL_LOG_SERVER_HOST` no momento de `nginx -t`/boot, não de forma preguiçosa no primeiro log
+  — se o hostname não resolver nesse momento, o Nginx inteiro falha a validar e **não sobe**, não
+  é só o encaminhamento de log que fica faltando. Isso significa que uma feature pensada como
+  "plus"/opcional pode virar risco de disponibilidade do proxy real se o Central Log Server ficar
+  brevemente sem resolver DNS bem na hora de um boot/reload de réplica. Recomendação pro operador:
+  apontar `CENTRAL_LOG_SERVER_HOST` pra algo confiavelmente resolvível (nome DNS interno estável
+  ou IP literal), nunca algo efêmero. Mitigação automática (ex.: o agent validar/tolerar isso antes
+  de escrever o snippet) fica em aberto pra uma iteração futura.

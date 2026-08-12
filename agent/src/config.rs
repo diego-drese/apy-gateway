@@ -4,6 +4,8 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use sqlx::mysql::MySqlSslMode;
 
+use crate::logging_config::{self, LogDestination};
+
 fn required(name: &str) -> anyhow::Result<String> {
     std::env::var(name).with_context(|| format!("missing required env var {name}"))
 }
@@ -85,6 +87,8 @@ pub struct AppConfig {
     pub heartbeat_ttl: Duration,
     pub reconciliation_interval: Duration,
     pub replica_hostname: String,
+    pub nginx_snippets_dir: PathBuf,
+    pub log_destination: LogDestination,
 }
 
 /// Pure function (no direct env access) so the precedence is unit-testable without mutating
@@ -156,6 +160,12 @@ impl AppConfig {
                 300u64,
             )?),
             replica_hostname: resolve_replica_hostname(),
+            nginx_snippets_dir: PathBuf::from(optional("NGINX_SNIPPETS_DIR", "/etc/nginx/snippets")),
+            log_destination: logging_config::resolve_log_destination(
+                optional_parsed("LOG_FORWARDING_ENABLED", false)?,
+                std::env::var("CENTRAL_LOG_SERVER_HOST").ok(),
+                optional_parsed("CENTRAL_LOG_SERVER_PORT", 514u16)?,
+            )?,
         })
     }
 }

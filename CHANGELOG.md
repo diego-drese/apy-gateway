@@ -44,6 +44,70 @@ mudou e o que falta.
     configuração pra ele em vez de subir os containers bundled (SPEC.md §13.3).
 
 ### Implementado
+- **Fase 10 — Observabilidade** (SPEC.md §12): duas metades, ambas fechadas nesta fase — logs
+  centralizados via encaminhamento **opt-in** (decisão do usuário: quem não quiser centralizar
+  continua acessando log local de cada réplica, sem mudança nenhuma de comportamento) e métricas
+  de sincronização por réplica (`GET /api/replicas`, antes "não implementado").
+  **Agent (Rust) — zero dependências novas no Cargo.toml de novo** (`std::net::UdpSocket`,
+  `std::process::Command`, `serde_json` e `tokio::sync::watch` já eram dependências/features já
+  usadas). Heartbeat deixou de ser um inteiro cru no Redis e virou JSON estruturado
+  (`{ts,ip,agent_version,nginx_version,synced_domains_count}`) — `ip` autodetectado via
+  `UdpSocket::connect(db_host:db_port).local_addr()` (truque padrão, não manda pacote nenhum,
+  só pergunta pro SO qual interface local seria usada), `nginx_version` via `nginx -v` rodado uma
+  vez no boot (mais fiel que uma env var fixa que podia dessincronizar da imagem base real),
+  ambos detectados uma única vez (invariantes pra vida do container, mesmo padrão de
+  `replica_hostname`). `synced_domains_count` flui de `SyncOutcome` (novo campo, preenchido com
+  `agent_state.domains.len()` no fim de `run_bootstrap`/`sync_incremental`) pra dentro do
+  `heartbeat_loop` via um `tokio::sync::watch::channel` atualizado depois de cada sync bem-sucedida.
+  **Log encaminhado via suporte nativo do Nginx a `access_log syslog:server=...;`** — não um
+  daemon rsyslog local: o agent continua supervisionando só o Nginx, nunca ganha um segundo
+  processo (decisão confirmada com o usuário). Flag `LOG_FORWARDING_ENABLED` (default `false`) +
+  `CENTRAL_LOG_SERVER_HOST`/`CENTRAL_LOG_SERVER_PORT`; desligado, comportamento idêntico ao que já
+  existia (arquivos symlinkados pra stdout/stderr pela imagem base do Nginx). O snippet gerado
+  (`nginx/snippets/logging.conf`) é escrito pelo agent no boot (`logging_config.rs`) — diferente
+  dos outros snippets do repo, que são arquivos estáticos `COPY`ados pelo `nginx/Dockerfile`; esse
+  só existe depois que o agent roda.
+  **Duas descobertas empíricas reais durante a verificação, nenhuma hipotética** (ver
+  `docker/observability-verification/README.md`): (1) a tag do syslog do Nginx só aceita
+  alfanumérico e underscore — a primeira versão usou `apy-gateway-nginx` (hífen, igual a toda
+  outra convenção do projeto) e `nginx -t` rejeitou; corrigido pra `apy_gateway_nginx`.
+  (2) o Nginx resolve o hostname do `CENTRAL_LOG_SERVER_HOST` no momento de `nginx -t`/boot, não
+  de forma preguiçosa no primeiro log — hostname não resolvível faz o Nginx inteiro falhar a subir,
+  não só o encaminhamento de log ficar faltando. Registrado como risco real em aberto no SPEC.md
+  §16 (recomendação: apontar pra algo confiavelmente resolvível, nunca algo efêmero).
+  **Control-plane**: `replica_agents` ganhou `synced_domains_count` (nullable — null é "nunca
+  recebeu heartbeat válido", nunca confundir com zero real). `SyncReplicaMetricsFromHeartbeatsAction`
+  lê `KEYS apy-gateway:replicas:*:heartbeat` + `MGET` na conexão Redis dedicada `events` (mesma
+  usada por `RecordDomainEventAction` desde a Fase 4), `updateOrCreate` por hostname,
+  payload malformado ou chave que expirou entre o `KEYS` e o `MGET` é ignorado com log (mesmo
+  padrão do agent pra evento de domínio malformado). **A liveness usa o TTL do Redis como fonte de
+  verdade**: qualquer `replica_agents` que estava `online` e não apareceu no scan atual vira
+  `offline` — nenhum relógio/estado de expiração duplicado do lado PHP.
+  `SyncReplicaMetricsCommand` (`replicas:sync-metrics`) roda a cada minuto (piso do scheduler do
+  Laravel — segunda entrada de `Schedule::` do projeto, depois da renovação ACME da Fase 9), então
+  o flip pra `offline` pode atrasar até ~60-100s além do TTL real — aceitável pra métricas de
+  observabilidade, documentado no SPEC como trade-off, não um requisito de tempo real.
+  `GET /api/replicas` (`ReplicaController`/`ReplicaAgentResource`/`ReplicaAgentPolicy`, só
+  `viewAny`) segue o mesmo gate `auth:sanctum + ip.allowlist` de todo o resto.
+  **Simplificação deliberada, registrada no SPEC**: `synced_domains_count` é agregado por réplica,
+  não quebrado por domínio (SPEC.md §12 antigo dizia literalmente "versão aplicada por domínio") —
+  criar uma tabela filha réplica-domínio pra isso seria desproporcional a "métricas mínimas"; o
+  detalhe por domínio continua só no `state.json` local e efêmero de cada réplica.
+  **10 testes novos** (44 Rust total — `resolve_log_destination`/`render_snippet`/`write_snippet`,
+  `parse_version_output`, `detect_local_ip`, round-trip do `HeartbeatPayload`; 97 PHP total —
+  `SyncReplicaMetricsCommandTest` com Redis mockado cobrindo hostname novo/existente/payload
+  malformado/chave sumida/flip pra offline/já-offline-não-reescreve, `ReplicaApiTest`).
+  **Verificação de ponta a ponta real** em `docker/observability-verification/` (harness novo —
+  nem estende `agent/tests/integration/`, que é só agent/migrate throwaway, nem reaproveita
+  `docker/acme-verification/`, específico do Pebble): rsyslog de verdade (`imudp`/`input()`
+  configurado à mão e testado isoladamente antes de entrar no compose — rsyslog não escuta nada
+  por padrão) recebendo linhas de access log reais via UDP com a tag correta; heartbeat JSON real
+  fluindo até `GET /api/replicas` (`status: online`, `synced_domains_count` batendo); heartbeat
+  parado de verdade + polling até o TTL expirar de verdade no Redis (nunca simulado/adiantado) +
+  `replicas:sync-metrics` confirmando o flip pra `status: offline`. Corrida real encontrada e
+  corrigida: o `agent` desse harness agora espera o `control-plane` ficar `healthy` (schema
+  migrado) antes de subir, não só o MySQL — sem isso o agent crashava no boot com
+  `Table 'proxy_hosts' doesn't exist`.
 - **Fase 9 — Emissão automática de certificados via ACME/Let's Encrypt (HTTP-01)** (SPEC.md §11,
   §9.4). Fecha a lacuna deixada aberta de propósito na Fase 7 (só upload manual). Control-plane é
   o único cliente ACME (RFC 8555); o agent Rust continua sem receber nenhuma chamada direta e
@@ -379,8 +443,7 @@ a filosofia de mudanças pequenas e verificáveis do projeto.
 - [x] **Fase 8 — Interface web** ✅ concluída — ver "Implementado" acima.
 - [x] **Fase 9 — Emissão automática via ACME/Let's Encrypt (HTTP-01)** ✅ concluída — ver
   "Implementado" acima.
-- [ ] **Fase 10 — Observabilidade**
-  Logs centralizados via rsyslog, métricas de sincronização por réplica (SPEC.md §12).
+- [x] **Fase 10 — Observabilidade** ✅ concluída — ver "Implementado" acima.
 
 - [ ] **Fase 11 — Ambiente Docker completo**
   `docker-compose.yml` de desenvolvimento (control-plane, MySQL, Redis, MinIO, Mailpit,

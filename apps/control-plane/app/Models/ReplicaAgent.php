@@ -10,7 +10,7 @@ use Illuminate\Database\Eloquent\Attributes\Fillable;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
-#[Fillable(['hostname', 'ip_address', 'agent_version', 'nginx_version', 'status', 'last_heartbeat_at'])]
+#[Fillable(['hostname', 'ip_address', 'agent_version', 'nginx_version', 'status', 'synced_domains_count', 'last_heartbeat_at'])]
 class ReplicaAgent extends Model
 {
     /** @use HasFactory<ReplicaAgentFactory> */
@@ -25,6 +25,7 @@ class ReplicaAgent extends Model
     {
         return [
             'status' => ReplicaAgentStatus::class,
+            'synced_domains_count' => 'integer',
             'last_heartbeat_at' => 'datetime',
         ];
     }
