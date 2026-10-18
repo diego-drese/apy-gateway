@@ -36,3 +36,5 @@
 #Nginx
 
 #Scripts
+# Variáveis de deploy da stack Swarm (deploy/swarm/.env.example é o modelo versionado)
+/deploy/swarm/.env

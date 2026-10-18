@@ -1,6 +1,9 @@
 #!/bin/sh
 set -e
 
+# Docker secrets (`{VAR}_FILE`) are resolved by Laravel itself (App\Support\Environment\
+# SecretFileEnvironment), not here: `docker exec ... php artisan` never runs this entrypoint.
+
 # Fase 11 (SPEC.md §13): one image, several roles — each is its own compose service,
 # differing only by this first argument. The image itself stays a generic "dispatch by role"
 # artifact; ordering between roles (e.g. migrate-before-web) is docker-compose's job (depends_on),

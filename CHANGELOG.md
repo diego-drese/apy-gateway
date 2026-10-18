@@ -13,6 +13,19 @@ mudou e o que falta.
 
 ## [Unreleased]
 
+### Painel — novo layout e correção de rotas
+- **Corrigido:** todo link do painel respondia `{"message":"Unauthenticated."}`. As rotas da API
+  tinham os mesmos nomes das rotas do painel (`proxy-hosts.index`, `certificates.index`,
+  `users.index`…) e, carregadas depois, sobrescreviam-nas. Rotas da API agora usam o prefixo
+  `api.` (`api.proxy-hosts.index`…). URLs da API não mudaram.
+- Novo layout no estilo do NPM: navegação em abas, Dashboard com contadores, listagens em card,
+  busca de domínio, tema claro/escuro (segue o sistema, alternável e lembrado no navegador).
+  CSS puro em `public/css/panel.css`, sem build e sem CDN. Decisões e guia de alteração em
+  [`docs/ui/layout.md`](./docs/ui/layout.md).
+- Formulário de proxy host com aba **SSL**: sem SSL / certificado existente / solicitar novo
+  Let's Encrypt (emitido logo após salvar e anexado automaticamente quando válido).
+- Nome padrão da aplicação passa a ser "APY Gateway" (`APP_NAME`).
+
 ### Documentação
 - Especificação técnica completa do sistema (`SPEC.md`): modelo de dados, fluxo de
   autenticação (IP allowlist + login + 2FA), protocolo de eventos via Redis, ciclo de vida
@@ -44,6 +57,70 @@ mudou e o que falta.
     configuração pra ele em vez de subir os containers bundled (SPEC.md §13.3).
 
 ### Implementado
+- **Fase 12 — Revisão geral, endurecimento e deploy em Swarm** (2026-10-17). Revisão completa do
+  código com correções de bugs reais, ferramenta de migração do NPM, stack de produção para Docker
+  Swarm, teste E2E automatizado e ensaio da migração num cluster simulado.
+  **Segurança (control-plane)**:
+  - `domain`/`forward_host` aceitavam qualquer string até 255 chars e eram renderizados verbatim no
+    `server_name`/`proxy_pass` de toda réplica — injeção de diretivas Nginx (ex.: um `alias` expondo
+    `/var/lib/apy-agent/certs`, i.e. as chaves privadas de todos os domínios). Novas regras
+    `App\Rules\Hostname` (domínio RFC 1123 minúsculo) e `App\Rules\ForwardHost` (hostname, nome de
+    serviço Swarm com `_`, ou IPv4) na API, no Livewire e no pedido ACME (que também interpola os
+    domínios no config do CSR). Regex com `D`: sem ele `$` aceitava um `\n` final. Domínio/upstream
+    normalizados para minúsculas (antes `Example.com` e `example.com` passavam no unique e
+    sobrescreviam o mesmo arquivo `conf.d` nas réplicas).
+  - `/login` e `/login/verify` (Livewire) não tinham allowlist de IP nem rate limit — porta lateral
+    para força bruta de senha e do código 2FA de 6 dígitos. Agora com `ip.allowlist` + throttle, e
+    ambos registrados como *persistent middleware* do Livewire (senão não rodam no
+    `/livewire/update`, onde a senha/código é realmente enviada). `/api/user` ganhou allowlist.
+  - **Login pela API nunca funcionou fora do navegador** (achado pelo E2E — o PHPUnit desliga CSRF):
+    `POST /auth/login`, `/auth/login/verify` e `/auth/ip-requests` estão no grupo `web` (o estado
+    "2FA pendente" fica na sessão) e respondiam 419. Agora isentos de CSRF (`bootstrap/app.php`),
+    com teste que não depende do bypass de testes.
+  **Robustez (control-plane)**: falha do Redis no publish não derruba mais a requisição (o evento
+  já está em `domain_events` e a reconciliação entrega — SPEC.md §8); `DeleteProxyHostAction` apaga
+  antes de publicar. Docker secrets (`*_FILE`) resolvidos pelo próprio Laravel
+  (`App\Support\Environment\SecretFileEnvironment`, no `bootstrap/app.php`) — não no entrypoint,
+  porque `docker exec ... php artisan` (todo comando administrativo do runbook) não passa por ele;
+  o ensaio pegou isso (`bootstrap-admin` sem senha do banco).
+  **Agent (Rust)**:
+  - Certificados em diretórios versionados (`certs/<domínio>/<id>-v<versão>/`, `cert_store.rs`): antes
+    um certificado novo inválido sobrescrevia o arquivo da config ativa; a config era revertida mas
+    o arquivo quebrado ficava, e todo `nginx -t` seguinte falhava — travando mudanças de *todos* os
+    domínios da réplica. Chave privada criada já com `0600`.
+  - Rename de domínio: a config do nome antigo continuava servindo até a reconciliação; agora é
+    removida na hora (mesmo `proxy_host_id`).
+  - `state.json` dizendo "aplicado" sem o arquivo em `conf.d` (volume só em `/var/lib/apy-agent`)
+    fazia o domínio nunca mais ser renderizado; agora ressincroniza.
+  - Uma linha inválida em `proxy_hosts` abortava o sync de todas; agora é pulada com log, e
+    `domain`/`forward_host` são validados de novo antes de renderizar (defesa em profundidade).
+  - `*_FILE` para credenciais e `REDIS_PASSWORD` (Redis com senha no Swarm).
+  **Nginx**: `server_names_hash_bucket_size 128` (domínios longos derrubavam o `nginx -t`), catch-all
+  em `:443` com `ssl_reject_handshake` (SNI desconhecido recebia o certificado de outro domínio),
+  `server_tokens off`, e `client_max_body_size 2000m` + timeouts de 90s iguais ao NPM.
+  **Docker/dev**: `minio/minio` e `minio/mc` deixaram de existir no Docker Hub (o `install.sh`
+  falhava em máquina nova) — trocados por `pgsty/minio`/`pgsty/mc` versionados e configuráveis
+  (`MINIO_IMAGE`/`MC_IMAGE`). Projeto Compose com nome fixo `apy-gateway`; portas publicadas
+  configuráveis pelo `.env`; `.dockerignore` sem os 2 GB de `agent/target`; cache de dependências
+  do cargo no `nginx/Dockerfile`.
+  **Novo**: `php artisan gateway:import-npm` (`ImportNpmProxyHostsAction`) — importa hosts e
+  certificados do Nginx Proxy Manager, idempotente, com dry-run, pulando com motivo o que não dá pra
+  reproduzir (access list, advanced config, custom locations). `deploy/swarm/` (stack de produção,
+  secrets, usuários de privilégio mínimo no MySQL/MinIO, comparação canário NPM x borda) e
+  `docs/deploy/swarm.md` (plano de instalação e migração). `scripts/e2e-test.sh` (E2E real) e
+  `deploy/swarm/simulation/` (ensaio em 4 nós docker-in-docker).
+  **Achados do ensaio em Swarm** (cada um viraria incidente no dia do corte): o MySQL recusa `GRANT`
+  em tabela que ainda não existe — o usuário do agent agora vem de um one-shot `db-grants` que
+  espera as migrations (e roda a cada deploy); `${VAR:?msg}` no `docker stack deploy` (Docker 27)
+  corrompe o valor da variável — a stack usa `${VAR}` e `deploy/swarm/deploy.sh` valida as
+  obrigatórias, a rede dos upstreams e os secrets; `docker service update --publish-rm` do NPM
+  precisa terminar (sem `--detach`) antes da borda assumir, senão o routing mesh continua
+  capturando 80/443; no corte a borda atualiza todos os nós de uma vez
+  (`EDGE_UPDATE_PARALLELISM=0`), já que o NPM soltou as portas.
+  **Verificado**: `scripts/e2e-test.sh` (39 checagens, do zero) e
+  `deploy/swarm/simulation/rehearsal.sh` (NPM real com 4 hosts → import → canário nos 4 nós →
+  corte → drills) passando de ponta a ponta.
+  **Testes**: control-plane 97 → 178; agent 44 → 64.
 - **Fase 11 — Ambiente Docker completo** (SPEC.md §13, §14): `docker compose up` (via
   `./scripts/install.sh`) sobe o ambiente de dev inteiro com um único comando — control-plane
   (web/queue/scheduler), MySQL, Redis, MinIO (+ `minio-init` criando o bucket idempotentemente),

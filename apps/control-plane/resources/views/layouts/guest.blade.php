@@ -1,16 +1,25 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ config('app.name') }}</title>
-    @include('layouts.partials.styles')
-    @livewireStyles
+    @include('layouts.partials.head')
 </head>
 <body>
-    <div class="card card-narrow">
-        {{ $slot }}
+    @include('layouts.partials.theme-toggle', ['class' => 'guest-theme'])
+
+    <div class="guest-shell">
+        <div class="guest-card">
+            <div class="brand guest-brand">
+                <span class="brand-mark"><x-icon name="network" class="icon-sm" /></span>
+                {{ config('app.name') }}
+            </div>
+            <div class="card">
+                <div class="card-body">
+                    {{ $slot }}
+                </div>
+            </div>
+        </div>
     </div>
+
     @livewireScripts
 </body>
 </html>

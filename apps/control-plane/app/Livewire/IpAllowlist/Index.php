@@ -11,10 +11,12 @@ use App\Enums\IpAccessRequestStatus;
 use App\Models\IpAccessRequest;
 use App\Models\IpAllowlistEntry;
 use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
 use Livewire\Component;
 use Livewire\WithPagination;
 
 #[Layout('layouts.app')]
+#[Title('Acesso por IP')]
 class Index extends Component
 {
     use WithPagination;

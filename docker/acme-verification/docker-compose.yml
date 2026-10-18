@@ -19,7 +19,7 @@ services:
       retries: 30
 
   minio:
-    image: minio/minio
+    image: ${MINIO_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin

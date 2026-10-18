@@ -1,8 +1,10 @@
 use std::collections::HashSet;
+use std::path::Path;
 
 use anyhow::Context;
 
 use crate::acme_challenges;
+use crate::cert_store;
 use crate::app_context::AppContext;
 use crate::event_bus::DomainEvent;
 use crate::models::ActiveProxyHost;
@@ -36,20 +38,9 @@ pub async fn run_bootstrap(app: &AppContext) -> anyhow::Result<SyncOutcome> {
         .cloned()
         .collect();
 
+    let tester = real_tester(app);
     for domain in stale {
-        let tester = RealNginxTester {
-            binary_path: &app.config.nginx_binary_path,
-            main_conf_path: &app.config.nginx_conf_path,
-        };
-        match nginx::remove_domain_config(&app.config.nginx_conf_d_path, &domain, &tester) {
-            Ok(()) => {
-                agent_state.domains.remove(&domain);
-                outcome.removed.push(domain);
-            }
-            Err(err) => {
-                tracing::error!(domain = %domain, error = %err, "failed to remove stale proxy host config; leaving it in place");
-            }
-        }
+        remove_domain(&local_paths(app), &tester, &domain, &mut agent_state, &mut outcome);
     }
 
     // Independent of the host-diffing loop above and never allowed to fail the whole bootstrap —
@@ -80,11 +71,7 @@ pub async fn sync_incremental(app: &AppContext, event: &DomainEvent) -> anyhow::
                 // explicit deletion instead of waiting up to `reconciliation_interval` for the
                 // periodic pass to notice (disabling a host is plausibly a "cut it now" action).
                 None => {
-                    let tester = RealNginxTester {
-                        binary_path: &app.config.nginx_binary_path,
-                        main_conf_path: &app.config.nginx_conf_path,
-                    };
-                    remove_by_host_id(&app.config.nginx_conf_d_path, &tester, event.subject_id, &mut agent_state, &mut outcome);
+                    remove_domains_of_host(&local_paths(app), &real_tester(app), event.subject_id, None, &mut agent_state, &mut outcome);
                 }
             }
         }
@@ -100,11 +87,7 @@ pub async fn sync_incremental(app: &AppContext, event: &DomainEvent) -> anyhow::
             }
         }
         "proxy_host.deleted" => {
-            let tester = RealNginxTester {
-                binary_path: &app.config.nginx_binary_path,
-                main_conf_path: &app.config.nginx_conf_path,
-            };
-            remove_by_host_id(&app.config.nginx_conf_d_path, &tester, event.subject_id, &mut agent_state, &mut outcome);
+            remove_domains_of_host(&local_paths(app), &real_tester(app), event.subject_id, None, &mut agent_state, &mut outcome);
         }
         // `subject_id` is ignored — the challenges table is small, so it's simpler and safer to
         // always resync the whole pending set than to correlate this event to specific domains.
@@ -127,13 +110,38 @@ pub async fn sync_incremental(app: &AppContext, event: &DomainEvent) -> anyhow::
     Ok(outcome)
 }
 
+/// The two local directories the agent owns per domain, bundled so removal helpers stay testable
+/// against temp dirs without a full `AppContext` (no MySQL pool / MinIO client needed).
+struct LocalPaths<'a> {
+    conf_d: &'a Path,
+    cert_storage: &'a Path,
+}
+
+fn local_paths(app: &AppContext) -> LocalPaths<'_> {
+    LocalPaths {
+        conf_d: &app.config.nginx_conf_d_path,
+        cert_storage: &app.config.cert_storage_dir,
+    }
+}
+
+fn real_tester(app: &AppContext) -> RealNginxTester<'_> {
+    RealNginxTester {
+        binary_path: &app.config.nginx_binary_path,
+        main_conf_path: &app.config.nginx_conf_path,
+    }
+}
+
 /// Shared diff-then-sync loop used by both a full reconciliation pass (all active hosts) and
 /// incremental sync (just the host(s) affected by one event).
 async fn sync_hosts(app: &AppContext, hosts: &[ActiveProxyHost], state: &mut AgentState) -> SyncOutcome {
     let mut outcome = SyncOutcome::default();
 
     for host in hosts {
-        if state::diff(state.domains.get(&host.domain), host) == state::DomainDiff::Unchanged {
+        // state.json and conf.d/ can drift apart (e.g. an operator mounted a volume on
+        // /var/lib/apy-agent but not on conf.d/): "state says applied" alone is not enough to
+        // skip, otherwise a domain would never be rendered again after a container restart.
+        let unchanged = state::diff(state.domains.get(&host.domain), host) == state::DomainDiff::Unchanged;
+        if unchanged && nginx::domain_config_exists(&app.config.nginx_conf_d_path, &host.domain) {
             continue;
         }
 
@@ -141,14 +149,17 @@ async fn sync_hosts(app: &AppContext, hosts: &[ActiveProxyHost], state: &mut Age
             Ok(new_state) => {
                 state.domains.insert(host.domain.clone(), new_state);
                 outcome.applied.push(host.domain.clone());
+                // A domain rename keeps the proxy_host id: the config rendered under the old name
+                // would otherwise keep serving it until the next full reconciliation.
+                remove_domains_of_host(&local_paths(app), &real_tester(app), host.id, Some(&host.domain), state, &mut outcome);
             }
             Err(err) => {
                 tracing::error!(
                     domain = %host.domain,
-                    error = %err,
+                    error = format!("{err:#}"),
                     "failed to sync proxy host; keeping last known-good config for this domain, will retry"
                 );
-                outcome.failed.push((host.domain.clone(), err.to_string()));
+                outcome.failed.push((host.domain.clone(), format!("{err:#}")));
                 // Deliberately not touching state here — absence means "retry every future run".
             }
         }
@@ -157,47 +168,64 @@ async fn sync_hosts(app: &AppContext, hosts: &[ActiveProxyHost], state: &mut Age
     outcome
 }
 
-/// Reverse-lookup a domain by its `proxy_host_id` in local state and remove its config. Used
-/// both for `proxy_host.deleted` events and for hosts that disappeared/got disabled between an
-/// event being published and the agent acting on it — the row is gone from MySQL either way, so
-/// there's nothing left to query by id.
+/// Removes every locally-applied domain belonging to `host_id`, except `keep` (the host's current
+/// domain, when called after a successful apply). Used for `proxy_host.deleted` events, for hosts
+/// that disappeared/got disabled between publish and processing (`keep = None`), and for renames
+/// (`keep = Some(new_domain)`). Matches by id from local state — the row may already be gone from
+/// MySQL, so there is nothing left to query.
 ///
-/// Takes only the Nginx-related config it needs (not the whole `AppContext`), and an injectable
-/// `ConfigTester` (not a hardcoded `RealNginxTester`), so it's testable against a real temp
-/// directory + a fake tester, without a live MySQL pool/MinIO client or an actual `nginx` binary
-/// — the same seam `nginx::apply_domain_config`/`remove_domain_config` already established.
-fn remove_by_host_id(
-    nginx_conf_d_path: &std::path::Path,
+/// Takes an injectable `ConfigTester` (not a hardcoded `RealNginxTester`), so it's testable
+/// against real temp directories + a fake tester, without a live MySQL pool/MinIO client or an
+/// actual `nginx` binary — the same seam `nginx::apply_domain_config` already established.
+fn remove_domains_of_host(
+    paths: &LocalPaths,
     tester: &dyn nginx::ConfigTester,
     host_id: u64,
+    keep: Option<&str>,
     state: &mut AgentState,
     outcome: &mut SyncOutcome,
 ) {
-    let domain = state
+    let domains: Vec<String> = state
         .domains
         .iter()
-        .find(|(_, s)| s.proxy_host_id == host_id)
-        .map(|(d, _)| d.clone());
+        .filter(|(domain, s)| s.proxy_host_id == host_id && Some(domain.as_str()) != keep)
+        .map(|(domain, _)| domain.clone())
+        .collect();
 
-    let Some(domain) = domain else {
+    if domains.is_empty() && keep.is_none() {
         tracing::debug!(proxy_host_id = host_id, "no local state for this host id — nothing to remove");
-        return;
-    };
+    }
 
-    match nginx::remove_domain_config(nginx_conf_d_path, &domain, tester) {
-        Ok(()) => {
-            state.domains.remove(&domain);
-            outcome.removed.push(domain);
-        }
-        Err(err) => {
-            tracing::error!(domain = %domain, error = %err, "failed to remove proxy host config; leaving it in place");
-            outcome.failed.push((domain, err.to_string()));
-        }
+    for domain in domains {
+        remove_domain(paths, tester, &domain, state, outcome);
     }
 }
 
+/// Removes one domain's rendered config (with the `nginx -t` safety net) and, only once that
+/// succeeded, its local certificate material.
+fn remove_domain(
+    paths: &LocalPaths,
+    tester: &dyn nginx::ConfigTester,
+    domain: &str,
+    state: &mut AgentState,
+    outcome: &mut SyncOutcome,
+) {
+    if let Err(err) = nginx::remove_domain_config(paths.conf_d, domain, tester) {
+        tracing::error!(domain = %domain, error = format!("{err:#}"), "failed to remove proxy host config; leaving it in place");
+        outcome.failed.push((domain.to_string(), format!("{err:#}")));
+        return;
+    }
+
+    if let Err(err) = cert_store::remove_domain(paths.cert_storage, domain) {
+        tracing::warn!(domain = %domain, error = format!("{err:#}"), "removed config but failed to delete local certificate files");
+    }
+
+    state.domains.remove(domain);
+    outcome.removed.push(domain.to_string());
+}
+
 async fn sync_one_domain(app: &AppContext, host: &ActiveProxyHost) -> anyhow::Result<DomainState> {
-    let ssl = match &host.certificate {
+    let cert_dir = match &host.certificate {
         Some(cert) => {
             let storage_path = cert.storage_path.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
@@ -206,35 +234,56 @@ async fn sync_one_domain(app: &AppContext, host: &ActiveProxyHost) -> anyhow::Re
                     cert.id
                 )
             })?;
-            let dest_dir = app.config.cert_storage_dir.join(&host.domain);
-            let paths = app
-                .minio
-                .download_certificate(storage_path, &dest_dir)
+            let dir = cert_store::version_dir(&app.config.cert_storage_dir, &host.domain, cert.id, cert.version);
+            // Only a directory created by *this* attempt may be discarded on failure — an existing
+            // one can be what the currently-live config points at (e.g. retry after drift).
+            let created_now = !dir.exists();
+            app.minio
+                .download_certificate(storage_path, &dir)
                 .await
                 .with_context(|| format!("downloading certificate for {}", host.domain))?;
-
-            Some(templates::SslTemplateContext {
-                crt_path: paths.crt_path.display().to_string(),
-                key_path: paths.key_path.display().to_string(),
-            })
+            Some((dir, created_now))
         }
         None => None,
     };
 
-    let rendered = app.templates.render_proxy_host(&templates::ProxyHostTemplateContext {
-        domain: host.domain.clone(),
-        forward_scheme: host.forward_scheme.as_str().to_string(),
-        forward_host: host.forward_host.clone(),
-        forward_port: host.forward_port,
-        websockets_enabled: host.websockets_enabled,
-        ssl,
-    })?;
+    let ssl = cert_dir.as_ref().map(|(dir, _)| templates::SslTemplateContext {
+        crt_path: dir.join("fullchain.pem").display().to_string(),
+        key_path: dir.join("privkey.pem").display().to_string(),
+    });
 
-    let tester = RealNginxTester {
-        binary_path: &app.config.nginx_binary_path,
-        main_conf_path: &app.config.nginx_conf_path,
+    let applied = app
+        .templates
+        .render_proxy_host(&templates::ProxyHostTemplateContext {
+            domain: host.domain.clone(),
+            forward_scheme: host.forward_scheme.as_str().to_string(),
+            forward_host: host.forward_host.clone(),
+            forward_port: host.forward_port,
+            websockets_enabled: host.websockets_enabled,
+            ssl,
+        })
+        .and_then(|rendered| {
+            nginx::apply_domain_config(&app.config.nginx_conf_d_path, &host.domain, &rendered, &real_tester(app))
+        });
+
+    if let Err(err) = applied {
+        if let Some((dir, true)) = &cert_dir {
+            if let Err(cleanup_err) = cert_store::discard_version(dir) {
+                tracing::warn!(domain = %host.domain, error = format!("{cleanup_err:#}"), "failed to discard rejected certificate version");
+            }
+        }
+        return Err(err);
+    }
+
+    // The new config is live (passed `nginx -t`): older certificate versions — or all of them,
+    // when the certificate was detached — are no longer referenced by anything.
+    let cleanup = match &cert_dir {
+        Some((dir, _)) => cert_store::prune_other_versions(&app.config.cert_storage_dir, &host.domain, dir),
+        None => cert_store::remove_domain(&app.config.cert_storage_dir, &host.domain),
     };
-    nginx::apply_domain_config(&app.config.nginx_conf_d_path, &host.domain, &rendered, &tester)?;
+    if let Err(err) = cleanup {
+        tracing::warn!(domain = %host.domain, error = format!("{err:#}"), "failed to prune unused certificate versions");
+    }
 
     Ok(DomainState {
         proxy_host_id: host.id,
@@ -282,16 +331,26 @@ mod tests {
         state
     }
 
+    fn paths(dir: &Path) -> LocalPaths<'_> {
+        LocalPaths { conf_d: dir, cert_storage: dir }
+    }
+
+    fn remove_by_host_id(dir: &Path, tester: &dyn ConfigTester, host_id: u64, state: &mut AgentState, outcome: &mut SyncOutcome) {
+        remove_domains_of_host(&paths(dir), tester, host_id, None, state, outcome);
+    }
+
     #[test]
     fn remove_by_host_id_finds_and_removes_known_domain() {
         let dir = unique_temp_dir("found");
         std::fs::write(dir.join("example.com.conf"), "server {}").unwrap();
+        std::fs::create_dir_all(dir.join("example.com").join("1-v1")).unwrap();
         let mut state = state_with_domain("example.com", 42);
         let mut outcome = SyncOutcome::default();
 
         remove_by_host_id(&dir, &AlwaysOk, 42, &mut state, &mut outcome);
 
         assert!(!dir.join("example.com.conf").exists());
+        assert!(!dir.join("example.com").exists(), "certificate material must be removed with the config");
         assert!(!state.domains.contains_key("example.com"));
         assert_eq!(outcome.removed, vec!["example.com".to_string()]);
         assert!(outcome.failed.is_empty());
@@ -328,14 +387,50 @@ mod tests {
     fn remove_by_host_id_reverts_and_records_failure_when_nginx_t_fails() {
         let dir = unique_temp_dir("revert");
         std::fs::write(dir.join("example.com.conf"), "server {}").unwrap();
+        std::fs::create_dir_all(dir.join("example.com").join("1-v1")).unwrap();
         let mut state = state_with_domain("example.com", 42);
         let mut outcome = SyncOutcome::default();
 
         remove_by_host_id(&dir, &AlwaysFail, 42, &mut state, &mut outcome);
 
         assert!(dir.join("example.com.conf").exists());
+        assert!(dir.join("example.com").join("1-v1").exists(), "certificates of a still-live config must survive");
         assert!(state.domains.contains_key("example.com"));
         assert!(outcome.removed.is_empty());
         assert_eq!(outcome.failed.len(), 1);
+    }
+
+    #[test]
+    fn rename_removes_the_old_domain_but_keeps_the_new_one() {
+        let dir = unique_temp_dir("rename");
+        std::fs::write(dir.join("old.example.com.conf"), "server {}").unwrap();
+        std::fs::write(dir.join("new.example.com.conf"), "server {}").unwrap();
+        let mut state = state_with_domain("old.example.com", 7);
+        state.domains.insert(
+            "new.example.com".to_string(),
+            DomainState { proxy_host_id: 7, proxy_host_version: 2, certificate_id: None, certificate_version: None },
+        );
+        let mut outcome = SyncOutcome::default();
+
+        remove_domains_of_host(&paths(&dir), &AlwaysOk, 7, Some("new.example.com"), &mut state, &mut outcome);
+
+        assert!(!dir.join("old.example.com.conf").exists());
+        assert!(dir.join("new.example.com.conf").exists());
+        assert_eq!(outcome.removed, vec!["old.example.com".to_string()]);
+        assert!(state.domains.contains_key("new.example.com"));
+        assert!(!state.domains.contains_key("old.example.com"));
+    }
+
+    #[test]
+    fn keep_only_does_not_touch_other_hosts() {
+        let dir = unique_temp_dir("keep-other-hosts");
+        std::fs::write(dir.join("other.example.com.conf"), "server {}").unwrap();
+        let mut state = state_with_domain("other.example.com", 99);
+        let mut outcome = SyncOutcome::default();
+
+        remove_domains_of_host(&paths(&dir), &AlwaysOk, 7, Some("new.example.com"), &mut state, &mut outcome);
+
+        assert!(dir.join("other.example.com.conf").exists());
+        assert!(outcome.removed.is_empty());
     }
 }

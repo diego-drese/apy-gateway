@@ -16,7 +16,7 @@ Wait for healthy (`docker compose -f docker/observability-verification/docker-co
 then create the MinIO bucket (nothing auto-creates it):
 
 ```bash
-docker run --rm --network observability-verification_default --entrypoint sh minio/mc -c "
+docker run --rm --network observability-verification_default --entrypoint sh pgsty/mc:RELEASE.2026-10-18T00-00-00Z -c "
 mc alias set testminio http://minio:9000 minioadmin minioadmin &&
 mc mb testminio/apy-gateway-certs
 "

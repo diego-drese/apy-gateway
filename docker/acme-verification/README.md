@@ -17,7 +17,7 @@ Wait for healthy (`docker compose -f docker/acme-verification/docker-compose.yml
 the MinIO bucket (nothing auto-creates it — same as every other harness in this repo):
 
 ```bash
-docker run --rm --network apy-gateway-acme-verification_default --entrypoint sh minio/mc -c "
+docker run --rm --network apy-gateway-acme-verification_default --entrypoint sh pgsty/mc:RELEASE.2026-10-18T00-00-00Z -c "
 mc alias set testminio http://minio:9000 minioadmin minioadmin &&
 mc mb testminio/apy-gateway-certs
 "

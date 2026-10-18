@@ -6,9 +6,11 @@ namespace App\Livewire\Auth;
 
 use App\Actions\Auth\AttemptLoginAction;
 use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
 use Livewire\Component;
 
 #[Layout('layouts.guest')]
+#[Title('Entrar')]
 class Login extends Component
 {
     public string $email = '';

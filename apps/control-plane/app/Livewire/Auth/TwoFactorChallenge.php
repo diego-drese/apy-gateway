@@ -6,9 +6,11 @@ namespace App\Livewire\Auth;
 
 use App\Actions\Auth\VerifyTwoFactorCodeAction;
 use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
 use Livewire\Component;
 
 #[Layout('layouts.guest')]
+#[Title('Verificação em duas etapas')]
 class TwoFactorChallenge extends Component
 {
     public string $code = '';

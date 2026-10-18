@@ -1,0 +1,376 @@
+# apy-gateway em Docker Swarm (SPEC.md §13). Guia completo, incluindo a migração a partir do
+# Nginx Proxy Manager: docs/deploy/swarm.md.
+#
+#   ./deploy/swarm/deploy.sh          # valida deploy/swarm/.env e faz o `docker stack deploy`
+#
+# Topologia:
+#   - Núcleo (mysql, redis, minio, control-plane web/queue/scheduler): fixado num único nó com o
+#     label `apy-gateway.core=true`, volumes LOCAIS (SPEC.md §13.2 — nunca NFS/volume de rede).
+#   - Borda (edge = agent Rust + Nginx): `mode: global` em todo nó com `apy-gateway.edge=true`,
+#     portas 80/443 em `mode: host` (o routing mesh do ingress esconderia o IP real do cliente).
+#   - Credenciais só via Docker secrets (`*_FILE`), criadas antes por deploy/swarm/create-secrets.sh.
+#
+# Variáveis obrigatórias usam `${VAR}`: o `docker stack deploy` corrompe o
+# VALOR da variável quando a mensagem tem espaços/parênteses (visto no ensaio: "mailpit" -> "mail)").
+version: "3.8"
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-core-placement: &core-placement
+  constraints:
+    - node.labels.apy-gateway.core == true
+
+x-control-plane-env: &control-plane-env
+  APP_NAME: apy-gateway
+  APP_ENV: production
+  APP_DEBUG: "false"
+  APP_URL: ${CONTROL_PLANE_URL}
+  APP_KEY_FILE: /run/secrets/apy_gateway_app_key
+  DB_CONNECTION: mysql
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_DATABASE: apy_gateway
+  DB_USERNAME: apy_gateway
+  DB_PASSWORD_FILE: /run/secrets/apy_gateway_db_app_password
+  SESSION_DRIVER: database
+  CACHE_STORE: database
+  QUEUE_CONNECTION: redis
+  REDIS_CLIENT: predis
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD_FILE: /run/secrets/apy_gateway_redis_password
+  MAIL_MAILER: smtp
+  MAIL_HOST: ${MAIL_HOST}
+  MAIL_PORT: ${MAIL_PORT:-587}
+  MAIL_USERNAME: ${MAIL_USERNAME:-}
+  MAIL_PASSWORD: ${MAIL_PASSWORD:-}
+  MAIL_SCHEME: ${MAIL_SCHEME:-}
+  MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS}
+  MAIL_FROM_NAME: apy-gateway
+  ADMIN_NOTIFICATION_EMAIL: ${ADMIN_NOTIFICATION_EMAIL}
+  MINIO_ENDPOINT_URL: http://minio:9000
+  MINIO_REGION: us-east-1
+  MINIO_BUCKET: apy-gateway-certs
+  MINIO_ACCESS_KEY: apy-control-plane
+  MINIO_SECRET_KEY_FILE: /run/secrets/apy_gateway_minio_app_secret_key
+  MINIO_FORCE_PATH_STYLE: "true"
+  MINIO_SSE_ENABLED: "false"
+  ACME_BASE_URL: ${ACME_BASE_URL:-https://acme-v02.api.letsencrypt.org}
+  ACME_ACCOUNT_KEY_STORAGE_PATH: acme/account-key.pem
+  ACME_RENEWAL_THRESHOLD_DAYS: "30"
+  ACME_CHALLENGE_PROPAGATION_DELAY_SECONDS: "5"
+  ACME_POLL_MAX_ATTEMPTS: "20"
+  ACME_POLL_INTERVAL_SECONDS: "3"
+
+x-control-plane-secrets: &control-plane-secrets
+  - apy_gateway_app_key
+  - apy_gateway_db_app_password
+  - apy_gateway_redis_password
+  - apy_gateway_minio_app_secret_key
+
+services:
+  mysql:
+    image: ${MYSQL_IMAGE:-mysql:8.4}
+    environment:
+      MYSQL_DATABASE: apy_gateway
+      MYSQL_USER: apy_gateway
+      MYSQL_PASSWORD_FILE: /run/secrets/apy_gateway_db_app_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/apy_gateway_db_root_password
+    # Footprint pequeno de propósito: ~50 domínios cabem com folga em 128M de buffer pool.
+    command: ["--innodb-buffer-pool-size=${MYSQL_INNODB_BUFFER_POOL_SIZE:-128M}", "--performance-schema=OFF"]
+    secrets:
+      - apy_gateway_db_root_password
+      - apy_gateway_db_app_password
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks: [core]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$(cat /run/secrets/apy_gateway_db_root_password)\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    deploy:
+      placement: *core-placement
+      resources:
+        limits: { memory: 768M }
+        reservations: { memory: 256M }
+      restart_policy: { condition: any, delay: 5s }
+    logging: *logging
+
+  # One-shot idempotente: usuário somente-leitura do agent (configs/db-grants.sh). Espera as
+  # migrations, porque o MySQL não aceita GRANT em tabela que ainda não existe.
+  db-grants:
+    image: ${MYSQL_IMAGE:-mysql:8.4}
+    entrypoint: ["sh", "/db-grants.sh"]
+    environment:
+      MYSQL_DATABASE: apy_gateway
+    secrets:
+      - source: apy_gateway_db_root_password
+        target: db_root_password
+      - source: apy_gateway_db_agent_password
+        target: db_agent_password
+    configs:
+      - source: db_grants
+        target: /db-grants.sh
+    networks: [core]
+    deploy:
+      placement: *core-placement
+      restart_policy: { condition: on-failure, delay: 10s, max_attempts: 30 }
+    logging: *logging
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy noeviction --requirepass \"$$(cat /run/secrets/apy_gateway_redis_password)\""]
+    secrets: [apy_gateway_redis_password]
+    volumes:
+      - redis-data:/data
+    networks: [core]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/apy_gateway_redis_password)\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      placement: *core-placement
+      resources:
+        limits: { memory: 192M }
+      restart_policy: { condition: any, delay: 5s }
+    logging: *logging
+
+  minio:
+    # minio/minio deixou de ser publicado; pgsty/minio é build versionado do mesmo código (SPEC.md §14).
+    image: ${MINIO_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER_FILE: /run/secrets/apy_gateway_minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/apy_gateway_minio_root_password
+    secrets:
+      - apy_gateway_minio_root_user
+      - apy_gateway_minio_root_password
+    volumes:
+      - minio-data:/data
+    networks: [core]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      placement: *core-placement
+      resources:
+        limits: { memory: 384M }
+      restart_policy: { condition: any, delay: 5s }
+    logging: *logging
+
+  # One-shot idempotente: bucket + usuários de privilégio mínimo (configs/minio-init.sh).
+  minio-init:
+    image: ${MC_IMAGE:-pgsty/mc:RELEASE.2026-10-18T00-00-00Z}
+    entrypoint: ["sh", "/minio-init.sh"]
+    environment:
+      MINIO_BUCKET: apy-gateway-certs
+    secrets:
+      - source: apy_gateway_minio_root_user
+        target: minio_root_user
+      - source: apy_gateway_minio_root_password
+        target: minio_root_password
+      - source: apy_gateway_minio_app_secret_key
+        target: minio_app_secret_key
+      - source: apy_gateway_minio_agent_secret_key
+        target: minio_agent_secret_key
+    configs:
+      - source: minio_init
+        target: /minio-init.sh
+    networks: [core]
+    deploy:
+      placement: *core-placement
+      restart_policy: { condition: on-failure, delay: 10s, max_attempts: 20 }
+    logging: *logging
+
+  # One-shot: aplica migrations. Repete até o MySQL estar pronto; roda de novo a cada troca de
+  # imagem (deploy de versão nova).
+  migrate:
+    image: ${REGISTRY:-diegoneumann}/apy-gateway-control-plane:${APY_GATEWAY_VERSION}
+    command: ["migrate"]
+    environment: *control-plane-env
+    secrets: *control-plane-secrets
+    networks: [core]
+    healthcheck:
+      disable: true
+    deploy:
+      placement: *core-placement
+      restart_policy: { condition: on-failure, delay: 10s, max_attempts: 30 }
+    logging: *logging
+
+  # Painel + API. SPEC.md §6.0: nunca exposto à internet — porta publicada só no nó do núcleo, em
+  # mode host, para ser filtrada por firewall/VPN (ou acessada por túnel SSH). Em mode host o
+  # Laravel vê o IP real do administrador, que é o que a allowlist de IP compara.
+  control-plane:
+    image: ${REGISTRY:-diegoneumann}/apy-gateway-control-plane:${APY_GATEWAY_VERSION}
+    command: ["web"]
+    environment: *control-plane-env
+    secrets: *control-plane-secrets
+    ports:
+      - target: 80
+        published: ${CONTROL_PLANE_PORT:-8000}
+        protocol: tcp
+        mode: host
+    networks: [core]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost/up"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    deploy:
+      placement: *core-placement
+      resources:
+        limits: { memory: 384M }
+      update_config: { order: stop-first, failure_action: rollback }
+      restart_policy: { condition: any, delay: 5s }
+    logging: *logging
+
+  queue:
+    image: ${REGISTRY:-diegoneumann}/apy-gateway-control-plane:${APY_GATEWAY_VERSION}
+    command: ["queue"]
+    environment: *control-plane-env
+    secrets: *control-plane-secrets
+    networks: [core]
+    healthcheck:
+      disable: true
+    deploy:
+      placement: *core-placement
+      resources:
+        limits: { memory: 256M }
+      restart_policy: { condition: any, delay: 5s }
+    logging: *logging
+
+  # Exatamente 1 réplica: o scheduler do Laravel não tem lock distribuído aqui (renovação ACME,
+  # replicas:sync-metrics) — duas instâncias duplicariam os jobs.
+  scheduler:
+    image: ${REGISTRY:-diegoneumann}/apy-gateway-control-plane:${APY_GATEWAY_VERSION}
+    command: ["scheduler"]
+    environment: *control-plane-env
+    secrets: *control-plane-secrets
+    networks: [core]
+    healthcheck:
+      disable: true
+    deploy:
+      replicas: 1
+      placement: *core-placement
+      resources:
+        limits: { memory: 256M }
+      restart_policy: { condition: any, delay: 5s }
+    logging: *logging
+
+  # Réplica de borda (SPEC.md §13.1): efêmera, sem volume — nasce vazia e sincroniza tudo do núcleo.
+  # Só fica "healthy" depois que o Nginx sobe com a configuração sincronizada (SPEC.md §9.1).
+  edge:
+    image: ${REGISTRY:-diegoneumann}/apy-gateway-nginx:${APY_GATEWAY_VERSION}
+    environment:
+      AGENT_HOSTNAME: "{{.Node.Hostname}}"
+      DB_HOST: mysql
+      DB_PORT: "3306"
+      DB_DATABASE: apy_gateway
+      DB_USERNAME: apy_agent
+      DB_PASSWORD_FILE: /run/secrets/apy_gateway_db_agent_password
+      # MySQL 8 gera certificado próprio no primeiro boot: "preferred" já cifra o tráfego. Com uma
+      # CA própria, use verify_identity + DB_SSL_CA_PATH (SPEC.md §9.4).
+      DB_SSL_MODE: ${EDGE_DB_SSL_MODE:-preferred}
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_BUCKET: apy-gateway-certs
+      MINIO_ACCESS_KEY: apy-agent
+      MINIO_SECRET_KEY_FILE: /run/secrets/apy_gateway_minio_agent_secret_key
+      MINIO_FORCE_PATH_STYLE: "true"
+      REDIS_URL: redis://redis:6379/
+      REDIS_PASSWORD_FILE: /run/secrets/apy_gateway_redis_password
+      HEARTBEAT_INTERVAL_SECS: "15"
+      HEARTBEAT_TTL_SECS: "45"
+      RECONCILIATION_INTERVAL_SECS: "300"
+      NGINX_READINESS_TIMEOUT_SECS: "60"
+      RUST_LOG: info
+      LOG_FORWARDING_ENABLED: "false"
+    secrets:
+      - apy_gateway_db_agent_password
+      - apy_gateway_minio_agent_secret_key
+      - apy_gateway_redis_password
+    ports:
+      # Durante a migração ficam em portas alternativas (EDGE_HTTP_PORT=8080 / EDGE_HTTPS_PORT=8443)
+      # enquanto o NPM ainda segura 80/443; no corte, viram 80/443 (docs/deploy/swarm.md).
+      - target: 80
+        published: ${EDGE_HTTP_PORT:-80}
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: ${EDGE_HTTPS_PORT:-443}
+        protocol: tcp
+        mode: host
+    networks:
+      - core
+      - upstreams
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.labels.apy-gateway.edge == true
+      resources:
+        limits: { memory: 256M }
+        reservations: { memory: 32M }
+      # mode host não permite duas tasks na mesma porta do mesmo nó: o update é stop-first, um nó
+      # por vez, com rollback automático se a task nova não ficar healthy. No CORTE (e no rollback)
+      # use EDGE_UPDATE_PARALLELISM=0 (todos os nós juntos): o NPM já soltou 80/443, então ir nó a
+      # nó só deixaria os últimos nós sem nada escutando por mais tempo.
+      update_config:
+        parallelism: ${EDGE_UPDATE_PARALLELISM:-1}
+        delay: 20s
+        order: stop-first
+        failure_action: rollback
+        monitor: 60s
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+      restart_policy: { condition: any, delay: 5s }
+    logging: *logging
+
+networks:
+  # Tráfego agent <-> MySQL/Redis/MinIO cruza nós: overlay cifrado (IPsec) como camada de transporte
+  # enquanto o mTLS por réplica do SPEC.md §9.4 não existe. Exige o protocolo ESP (IP 50) liberado
+  # entre os nós, além de 2377/tcp, 7946/tcp+udp e 4789/udp.
+  core:
+    driver: overlay
+    driver_opts:
+      encrypted: "true"
+  # Rede overlay EXISTENTE onde estão os serviços que o NPM publica hoje (forward_host = nome do
+  # serviço). A borda entra nela para alcançar os mesmos upstreams sem mudar nenhum app.
+  upstreams:
+    external: true
+    name: ${UPSTREAMS_NETWORK}
+
+volumes:
+  mysql-data:
+  redis-data:
+  minio-data:
+
+configs:
+  # Configs do Swarm são imutáveis: ao alterar o arquivo, incremente o sufixo do nome.
+  db_grants:
+    name: apy_gateway_db_grants_v1
+    file: ./configs/db-grants.sh
+  minio_init:
+    name: apy_gateway_minio_init_v1
+    file: ./configs/minio-init.sh
+
+secrets:
+  apy_gateway_app_key: { external: true }
+  apy_gateway_db_root_password: { external: true }
+  apy_gateway_db_app_password: { external: true }
+  apy_gateway_db_agent_password: { external: true }
+  apy_gateway_redis_password: { external: true }
+  apy_gateway_minio_root_user: { external: true }
+  apy_gateway_minio_root_password: { external: true }
+  apy_gateway_minio_app_secret_key: { external: true }
+  apy_gateway_minio_agent_secret_key: { external: true }

@@ -25,3 +25,9 @@ CLAUDE.md
 docker-compose.yml
 docker-compose-local.yml
 .DS_Store
+
+# Artefatos locais pesados que nenhuma imagem copia (o nginx/Dockerfile compila o agent do zero).
+# Sem isso o contexto de build da raiz carregaria GBs de agent/target a cada build.
+agent/target
+apps/control-plane/vendor
+**/.idea

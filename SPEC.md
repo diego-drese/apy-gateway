@@ -128,6 +128,13 @@ O link de aprovação expira (ex.: 24h) e é de uso único.
 
 Toda tentativa de login, aprovação de IP e verificação de 2FA é registrada em `audit_logs`.
 
+As rotas JSON de autenticação ficam no grupo `web` (o estado "2FA pendente" vive na sessão) mas
+são isentas de CSRF — clientes de API não carregam página para obter o token. A tela de login web
+(Livewire) aplica a mesma allowlist e os mesmos rate limits, inclusive no `/livewire/update`.
+
+`domain` e `forward_host` são validados como hostname (`App\Rules\Hostname`/`ForwardHost`): ambos
+são renderizados verbatim na configuração do Nginx de toda réplica (ver §10).
+
 ## 7. API REST — recursos principais
 
 Todas as respostas seguem o padrão de Resources do Laravel (JSON:API-like, contrato estável).
@@ -218,6 +225,10 @@ interna do cluster e precisa de controles próprios, além da rede privada do §
 - `nginx/templates`: templates (ex. Handlebars/Tera) para `server { ... }` por `proxy_host`.
 - `nginx/snippets`: blocos reutilizáveis (headers de segurança, websockets, SSL comum).
 - O agent renderiza um arquivo por domínio em `conf.d/`, nunca edita o `nginx.conf` principal.
+- Certificados ficam em diretórios por versão (`certs/<domínio>/<id>-v<versão>/`): uma versão
+  rejeitada pelo `nginx -t` é descartada sem tocar nos arquivos da configuração ativa.
+- O agent revalida `domain`/`forward_host` antes de renderizar e pula (com log) linhas inválidas,
+  sem abortar o sync dos demais domínios.
 
 ## 11. Gestão de certificados SSL
 
@@ -328,7 +339,15 @@ diferente, conectando-se ao MySQL/Redis/MinIO centrais.
 - HA real do núcleo (múltiplos nós replicados, sem esse passo manual) é um upgrade possível, mas
   fora do escopo do MVP (§3) — ver §16.
 
-### 13.3 Deploy padrão (bundled) vs. serviço centralizado do cliente
+### 13.3 Docker Swarm (produção)
+
+`deploy/swarm/apy-gateway-stack.yml`: núcleo fixado por label (`apy-gateway.core`) com volumes
+locais; borda `mode: global` nos nós com `apy-gateway.edge`, portas 80/443 em `mode: host` (IP real
+do cliente); credenciais só por Docker secrets (`*_FILE`); usuários de privilégio mínimo no MySQL
+(`db-grants`) e no MinIO (`minio-init`). Passo a passo, migração do Nginx Proxy Manager e ensaio
+num cluster simulado: `docs/deploy/swarm.md`.
+
+### 13.4 Deploy padrão (bundled) vs. serviço centralizado do cliente
 
 - O deploy padrão sobe MySQL e MinIO junto com o control-plane no host do núcleo, via
   `docker compose` (§13.1) — é o caminho simples para desenvolvimento e instalações pequenas.
@@ -354,7 +373,9 @@ componentes com código próprio:
 desenvolvimento e CI (ex.: `cargo build`, `cargo test`) — **não é uma imagem publicada em
 produção**; o binário final é empacotado dentro de `apy-gateway-nginx`.
 
-MySQL, Redis e MinIO usam imagens oficiais do Docker Hub (`mysql`, `redis`, `minio/minio`) —
+MySQL e Redis usam imagens oficiais do Docker Hub (`mysql`, `redis`); MinIO usa builds versionados
+do próprio código do MinIO (`pgsty/minio`, `pgsty/mc`), porque `minio/minio`/`minio/mc` deixaram de
+ser publicados — a imagem é configurável (`MINIO_IMAGE`/`MC_IMAGE`) —
 não construímos nem publicamos imagens próprias para eles, apenas os referenciamos no
 `docker-compose.yml` com a configuração via variáveis de ambiente/volumes.
 

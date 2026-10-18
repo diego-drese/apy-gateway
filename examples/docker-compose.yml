@@ -7,6 +7,10 @@
 # verificação dedicados (docker/acme-verification/, docker/observability-verification/), pra não
 # duplicar config que já existe lá com risco real de desalinhar ao longo do tempo.
 
+# Fixed project name so containers/volumes/networks are always `apy-gateway-*`, no matter which
+# directory the command runs from (default would be the compose file's folder, `examples`).
+name: apy-gateway
+
 services:
   mysql:
     image: mysql:8
@@ -27,8 +31,11 @@ services:
       interval: 3s
       retries: 30
 
+  # minio/minio e minio/mc deixaram de ser publicados no Docker Hub (só existem em cache local antigo).
+  # pgsty/* são builds versionados e multi-arch do mesmo código do MinIO — troque via MINIO_IMAGE/
+  # MC_IMAGE no .env se preferir outro fornecedor.
   minio:
-    image: minio/minio
+    image: ${MINIO_IMAGE:-pgsty/minio:RELEASE.2026-08-04T00-00-00Z}
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
@@ -36,8 +43,8 @@ services:
     volumes:
       - minio-data:/data
     ports:
-      - "9000:9000"
-      - "19001:9001"
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-19001}:9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 3s
@@ -46,7 +53,7 @@ services:
   # One-shot: creates the bucket idempotently. Every prior verification harness paid this cost as
   # a manual documented step — a real "single command" dev environment can't leave that manual.
   minio-init:
-    image: minio/mc
+    image: ${MC_IMAGE:-pgsty/mc:RELEASE.2026-10-18T00-00-00Z}
     entrypoint: sh
     command:
       - -c
@@ -60,7 +67,7 @@ services:
   mailpit:
     image: axllent/mailpit
     ports:
-      - "8025:8025"
+      - "${MAILPIT_HTTP_PORT:-8025}:8025"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8025/api/v1/info"]
       interval: 3s
@@ -78,6 +85,8 @@ services:
     environment: &control_plane_env
       APP_KEY: ${APP_KEY}
       APP_ENV: local
+      # Links dos e-mails (definir senha, aprovar IP) precisam da porta publicada.
+      APP_URL: http://localhost:${CONTROL_PLANE_HTTP_PORT:-8000}
       DB_CONNECTION: mysql
       DB_HOST: mysql
       DB_PORT: "3306"
@@ -119,7 +128,7 @@ services:
     command: ["web"]
     environment: *control_plane_env
     ports:
-      - "8000:80"
+      - "${CONTROL_PLANE_HTTP_PORT:-8000}:80"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost/up"]
       interval: 3s
@@ -186,8 +195,8 @@ services:
       RUST_LOG: info
       LOG_FORWARDING_ENABLED: "false"
     ports:
-      - "8080:80"
-      - "8443:443"
+      - "${AGENT_HTTP_PORT:-8080}:80"
+      - "${AGENT_HTTPS_PORT:-8443}:443"
     depends_on:
       mysql:
         condition: service_healthy

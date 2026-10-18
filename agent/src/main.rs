@@ -1,5 +1,6 @@
 mod acme_challenges;
 mod app_context;
+mod cert_store;
 mod config;
 mod db;
 mod event_bus;
@@ -116,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
                     event_type = %event.event_type,
                     subject_id = event.subject_id,
                     event_id = %event.id,
+                    occurred_at = %event.occurred_at,
                     "received domain event"
                 );
                 let result = sync::sync_incremental(&app, &event).await;

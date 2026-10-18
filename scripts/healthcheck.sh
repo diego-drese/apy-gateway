@@ -5,6 +5,14 @@
 set -e
 
 cd "$(dirname "$0")/.."
+
+# Portas publicadas vêm do .env (examples/.env.example) — mesmos defaults do compose.
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
+
 COMPOSE="docker compose -f examples/docker-compose.yml --env-file .env"
 
 fail=0
@@ -20,11 +28,11 @@ check() {
   fi
 }
 
-check "control-plane (/up)" curl -fsS http://localhost:8000/up
+check "control-plane (/up)" curl -fsS "http://localhost:${CONTROL_PLANE_HTTP_PORT:-8000}/up"
 check "mysql"               $COMPOSE exec -T mysql mysqladmin ping -h 127.0.0.1 -uroot -p"${DB_PASSWORD:-root}"
 check "redis"                $COMPOSE exec -T redis redis-cli ping
-check "minio"                curl -fsS http://localhost:9000/minio/health/live
-check "mailpit"              curl -fsS http://localhost:8025/api/v1/info
+check "minio"                curl -fsS "http://localhost:${MINIO_API_PORT:-9000}/minio/health/live"
+check "mailpit"              curl -fsS "http://localhost:${MAILPIT_HTTP_PORT:-8025}/api/v1/info"
 
 if [ "$fail" -ne 0 ]; then
   echo "Algum serviço não respondeu. Veja: $COMPOSE ps / $COMPOSE logs <serviço>"

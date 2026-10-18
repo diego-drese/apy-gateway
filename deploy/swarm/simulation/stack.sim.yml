@@ -1,0 +1,13 @@
+# Override só do ensaio (deploy/swarm/simulation/rehearsal.sh), aplicado por cima da stack real:
+#   docker stack deploy -c apy-gateway-stack.yml -c simulation/stack.sim.yml apy-gateway
+# Acrescenta um Mailpit no lugar do SMTP real — tudo o mais é a stack de produção sem alteração.
+version: "3.8"
+
+services:
+  mailpit:
+    image: apy-sim-registry:5000/mailpit:v1.21
+    networks: [core]
+    deploy:
+      placement:
+        constraints:
+          - node.labels.apy-gateway.core == true

@@ -18,10 +18,10 @@ class DeleteProxyHostAction
 
     public function handle(ProxyHost $proxyHost, User $actor): void
     {
-        $version = $proxyHost->version;
-
-        $this->recordDomainEvent->handle(DomainEventType::ProxyHostDeleted, $proxyHost, $version, $actor->id);
-
+        // Delete first: publishing before the row is gone would let agents drop the config of a
+        // host that still exists if the delete then failed (until the next reconciliation).
         $proxyHost->delete();
+
+        $this->recordDomainEvent->handle(DomainEventType::ProxyHostDeleted, $proxyHost, $proxyHost->version, $actor->id);
     }
 }

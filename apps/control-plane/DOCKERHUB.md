@@ -73,7 +73,7 @@ services:
       retries: 30
 
   minio:
-    image: minio/minio
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -87,7 +87,7 @@ services:
 
   # One-shot: garante que o bucket dos certificados existe antes de qualquer outro serviço subir.
   minio-init:
-    image: minio/mc
+    image: pgsty/mc:RELEASE.2026-10-18T00-00-00Z
     entrypoint: sh
     command:
       - -c

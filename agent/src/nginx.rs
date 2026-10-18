@@ -44,6 +44,14 @@ pub fn sanitize_domain_filename(domain: &str) -> anyhow::Result<String> {
     Ok(domain.to_ascii_lowercase())
 }
 
+/// Whether a rendered config for `domain` is currently present in `conf.d/`. An unsafe domain is
+/// reported as absent, so the caller attempts a sync that then fails loudly with the real reason.
+pub fn domain_config_exists(conf_d_path: &Path, domain: &str) -> bool {
+    sanitize_domain_filename(domain)
+        .map(|filename| conf_d_path.join(format!("{filename}.conf")).is_file())
+        .unwrap_or(false)
+}
+
 /// Renders one domain's config into `conf.d/`, testing the *whole* config tree afterward (that's
 /// the only way `nginx -t` can validate anything) and reverting just this domain's file if the
 /// test fails — so one bad domain never blocks every other domain's valid changes.
@@ -263,6 +271,17 @@ mod tests {
         remove_domain_config(&dir, "example.com", &AlwaysOk).unwrap();
 
         assert!(!dir.join("example.com.conf").exists());
+    }
+
+    #[test]
+    fn domain_config_exists_reflects_conf_d_contents() {
+        let dir = unique_temp_dir("exists");
+        assert!(!domain_config_exists(&dir, "example.com"));
+
+        std::fs::write(dir.join("example.com.conf"), "server {}").unwrap();
+
+        assert!(domain_config_exists(&dir, "example.com"));
+        assert!(!domain_config_exists(&dir, "../example.com"));
     }
 
     #[test]

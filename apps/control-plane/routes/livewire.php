@@ -6,17 +6,26 @@ use App\Http\Controllers\Auth\LogoutController;
 use App\Livewire\Auth\Login;
 use App\Livewire\Auth\TwoFactorChallenge;
 use App\Livewire\Certificates;
+use App\Livewire\Dashboard;
 use App\Livewire\IpAllowlist;
 use App\Livewire\ProxyHosts;
 use App\Livewire\Users;
 use Illuminate\Support\Facades\Route;
 
-Route::get('/login', Login::class)->middleware('guest')->name('login');
-Route::get('/login/verify', TwoFactorChallenge::class)->middleware('guest')->name('login.verify');
+// SPEC.md §6.2: same guards as the API's /auth/login(/verify). EnsureIpIsAllowlisted and
+// ThrottleRequests are registered as Livewire persistent middleware (AppServiceProvider), so they
+// also run on every /livewire/update call these pages make — that is where the password and the
+// 2FA code are actually submitted.
+Route::get('/login', Login::class)
+    ->middleware(['guest', 'throttle:login', 'ip.allowlist'])
+    ->name('login');
+Route::get('/login/verify', TwoFactorChallenge::class)
+    ->middleware(['guest', 'throttle:login-verify', 'ip.allowlist'])
+    ->name('login.verify');
 Route::post('/logout', LogoutController::class)->middleware('auth')->name('logout');
 
 Route::middleware(['auth', 'ip.allowlist'])->group(function () {
-    Route::get('/', ProxyHosts\Index::class)->name('dashboard');
+    Route::get('/', Dashboard::class)->name('dashboard');
     Route::get('/proxy-hosts', ProxyHosts\Index::class)->name('proxy-hosts.index');
     Route::get('/proxy-hosts/create', ProxyHosts\Create::class)->name('proxy-hosts.create');
     Route::get('/proxy-hosts/{proxy_host}/edit', ProxyHosts\Edit::class)->name('proxy-hosts.edit');

@@ -1,13 +1,12 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::Context;
 use aws_sdk_s3::config::{BehaviorVersion, Builder, Credentials, Region};
 
 use crate::config::MinioConfig;
 
-/// Placeholder convention — Fase 7 (certificate issuance) owns the real upload contract and may
-/// redefine this. For now, a `ssl_certificates.storage_path` maps deterministically to two
-/// objects in the bucket.
+/// Contract with the control-plane (UploadCertificateAction / PerformAcmeCertificateIssuanceAction):
+/// a `ssl_certificates.storage_path` maps deterministically to two objects in the bucket.
 pub struct CertObjectKeys {
     pub crt: String,
     pub key: String,
@@ -18,11 +17,6 @@ pub fn cert_object_keys(storage_path: &str) -> CertObjectKeys {
         crt: format!("{storage_path}.crt"),
         key: format!("{storage_path}.key"),
     }
-}
-
-pub struct CertPaths {
-    pub crt_path: PathBuf,
-    pub key_path: PathBuf,
 }
 
 pub struct MinioClient {
@@ -73,7 +67,9 @@ impl MinioClient {
         Ok(bytes.into_bytes().to_vec())
     }
 
-    /// Downloads the certificate chain and private key for `storage_path` into `dest_dir`.
+    /// Downloads the certificate chain and private key for `storage_path` into `dest_dir` — a
+    /// per-version directory (see `cert_store::version_dir`), never the directory the live config
+    /// currently points at.
     ///
     /// `content_hash` verification is intentionally not implemented here — nothing populates
     /// `ssl_certificates.content_hash` with a defined meaning yet (Fase 7 decides that).
@@ -81,7 +77,7 @@ impl MinioClient {
         &self,
         storage_path: &str,
         dest_dir: &Path,
-    ) -> anyhow::Result<CertPaths> {
+    ) -> anyhow::Result<()> {
         let keys = cert_object_keys(storage_path);
         let crt_bytes = self
             .download_object(&keys.crt)
@@ -98,16 +94,10 @@ impl MinioClient {
         let crt_path = dest_dir.join("fullchain.pem");
         let key_path = dest_dir.join("privkey.pem");
         std::fs::write(&crt_path, &crt_bytes).context("writing certificate chain to disk")?;
-        std::fs::write(&key_path, &key_bytes).context("writing certificate private key to disk")?;
-
         // Private key material — never world/group readable, never logged (SPEC.md §15).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-                .context("restricting private key file permissions")?;
-        }
+        crate::cert_store::write_private_key(&key_path, &key_bytes)
+            .context("writing certificate private key to disk")?;
 
-        Ok(CertPaths { crt_path, key_path })
+        Ok(())
     }
 }

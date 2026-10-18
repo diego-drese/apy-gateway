@@ -90,6 +90,8 @@ O que já foi implementado e os próximos passos estão em **[CHANGELOG.md](./CH
 | `docker` | Arquivos de suporte ao ambiente Docker. |
 | `examples` | Exemplos de `docker-compose` para dev e para topologia de cluster. |
 | `scripts` | Scripts de instalação, atualização e healthcheck. |
+| `deploy/swarm` | Stack de produção para Docker Swarm, segredos e ensaio da migração ([guia](./docs/deploy/swarm.md)). |
+| `docs` | Guias operacionais (deploy em Swarm, migração do Nginx Proxy Manager). |
 
 ## Como rodar localmente
 
@@ -106,6 +108,26 @@ partir de `examples/.env.example` na primeira execução; espera todos os servi�
 saudáveis; e libera `127.0.0.1` + cria o primeiro usuário admin (link de senha via Mailpit em
 http://localhost:8025). `./scripts/update.sh` reconstrói as imagens após mudanças de código;
 `./scripts/healthcheck.sh` confirma que cada serviço está respondendo de verdade.
+
+Portas ocupadas por outro projeto? Ajuste `CONTROL_PLANE_HTTP_PORT`, `MAILPIT_HTTP_PORT`,
+`AGENT_HTTP_PORT` etc. no `.env` (modelo em `examples/.env.example`).
+
+## Testes
+
+```bash
+# Unitários/integração do control-plane e do agent (em containers, nada instalado no host)
+docker run --rm -v "$PWD/apps/control-plane":/app -w /app php:8.3-cli php artisan test
+docker run --rm -v "$PWD":/repo -w /repo/agent rust:1-alpine sh -c 'apk add -q musl-dev && cargo test'
+
+# Ponta a ponta: API (login + 2FA) -> MySQL/MinIO -> Redis -> agent -> Nginx -> tráfego real,
+# incluindo TLS, rotação de certificado, rename, Redis fora do ar e uma segunda réplica (~5 min)
+./scripts/e2e-test.sh
+```
+
+## Produção (Docker Swarm) e migração do Nginx Proxy Manager
+
+Ver **[docs/deploy/swarm.md](./docs/deploy/swarm.md)** — topologia, passo a passo, corte com
+rollback e o ensaio completo num cluster simulado de 3 managers + 1 worker.
 
 ## Status
 

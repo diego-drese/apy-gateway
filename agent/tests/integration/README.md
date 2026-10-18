@@ -46,7 +46,7 @@ agent's placeholder convention (see `agent/src/minio.rs`) expects `<storage_path
 openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout /tmp/test-privkey.pem -out /tmp/test-fullchain.pem -days 1 -subj "/CN=secure.test.local"
 
-docker run --rm --network apy-gateway-integration-test_default -v /tmp:/certs --entrypoint sh minio/mc -c "
+docker run --rm --network apy-gateway-integration-test_default -v /tmp:/certs --entrypoint sh pgsty/mc:RELEASE.2026-10-18T00-00-00Z -c "
 mc alias set testminio http://minio:9000 minioadmin minioadmin &&
 mc mb testminio/apy-gateway-certs &&
 mc cp /certs/test-fullchain.pem testminio/apy-gateway-certs/certs/secure-test-local.crt &&

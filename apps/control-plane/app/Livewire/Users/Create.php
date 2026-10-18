@@ -7,9 +7,11 @@ namespace App\Livewire\Users;
 use App\Actions\User\CreateUserAction;
 use App\Models\User;
 use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
 use Livewire\Component;
 
 #[Layout('layouts.app')]
+#[Title('Novo usuário')]
 class Create extends Component
 {
     public string $name = '';

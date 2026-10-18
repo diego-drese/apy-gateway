@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # apy-gateway-nginx (SPEC.md §14): agent binary compiled here, packaged with Nginx.
 # Both stages are Alpine/musl so the stage-1 binary runs unmodified in stage 2.
 #
@@ -9,11 +10,16 @@ RUN apk add --no-cache musl-dev ca-certificates
 WORKDIR /agent
 COPY agent/Cargo.toml agent/Cargo.lock* ./
 COPY agent/src ./src
-RUN cargo build --release
+# Cache mounts keep the cargo registry and compiled dependencies between builds — without them any
+# change in agent/src recompiles the whole dependency tree (aws-sdk alone takes minutes). The binary
+# is copied out because a cache mount's content is not part of the image layer.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/agent/target \
+    cargo build --release && cp target/release/apy-agent /usr/local/bin/apy-agent
 
 FROM nginx:1.27-alpine
 RUN apk add --no-cache ca-certificates
-COPY --from=agent-build /agent/target/release/apy-agent /usr/local/bin/apy-agent
+COPY --from=agent-build /usr/local/bin/apy-agent /usr/local/bin/apy-agent
 COPY nginx/nginx.conf   /etc/nginx/nginx.conf
 COPY nginx/templates    /etc/apy-agent/templates
 COPY nginx/snippets     /etc/nginx/snippets

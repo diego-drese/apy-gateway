@@ -18,6 +18,13 @@ if ! grep -q "^APP_KEY=.\+" .env; then
   rm -f .env.bak
 fi
 
+# Portas publicadas vêm do .env (examples/.env.example) — mesmos defaults do compose.
+if [ -f .env ]; then
+  set -a
+  . ./.env
+  set +a
+fi
+
 COMPOSE="docker compose -f examples/docker-compose.yml --env-file .env"
 
 echo "Subindo os serviços..."
@@ -37,13 +44,13 @@ done
 echo "Liberando IP e criando o primeiro usuário admin (idempotente)..."
 $COMPOSE exec -T control-plane php artisan gateway:bootstrap-admin
 
-cat <<'EOF'
+cat <<EOF
 
 Pronto:
-  - Control-plane: http://localhost:8000
-  - Mailpit (e-mails de dev, inclusive o link pra definir a senha do admin): http://localhost:8025
-  - MinIO console: http://localhost:19001
-  - Réplica agent+nginx: http://localhost:8080 (HTTPS: https://localhost:8443)
+  - Control-plane: http://localhost:${CONTROL_PLANE_HTTP_PORT:-8000}
+  - Mailpit (e-mails de dev, inclusive o link pra definir a senha do admin): http://localhost:${MAILPIT_HTTP_PORT:-8025}
+  - MinIO console: http://localhost:${MINIO_CONSOLE_PORT:-19001}
+  - Réplica agent+nginx: http://localhost:${AGENT_HTTP_PORT:-8080} (HTTPS: https://localhost:${AGENT_HTTPS_PORT:-8443})
 
 Se acessar de um IP diferente de 127.0.0.1 (ex.: outra máquina na rede), rode:
   docker compose -f examples/docker-compose.yml --env-file .env exec control-plane \

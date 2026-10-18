@@ -50,7 +50,26 @@ pub async fn fetch_active_proxy_hosts(pool: &MySqlPool) -> anyhow::Result<Vec<Ac
         .await
         .context("failed to fetch active proxy_hosts")?;
 
-    rows.into_iter().map(TryInto::try_into).collect()
+    Ok(convert_rows_skipping_invalid(rows))
+}
+
+/// One malformed row (unknown scheme, unsafe host) must not abort the sync of every other domain
+/// — the same per-domain isolation `nginx::apply_domain_config` gives to `nginx -t` failures.
+/// Skipped rows are logged with their id so an operator can find and fix them; since they are not
+/// part of the active set, a previously-applied config for that domain is removed as stale.
+fn convert_rows_skipping_invalid(rows: Vec<ProxyHostRow>) -> Vec<ActiveProxyHost> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let id = row.id;
+            match ActiveProxyHost::try_from(row) {
+                Ok(host) => Some(host),
+                Err(err) => {
+                    tracing::error!(proxy_host_id = id, error = %err, "skipping invalid proxy_hosts row");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 const ACTIVE_PROXY_HOST_BY_ID_SQL: &str = r#"
@@ -106,7 +125,7 @@ pub async fn fetch_active_proxy_hosts_by_certificate_id(
         .await
         .context("failed to fetch active proxy_hosts by certificate id")?;
 
-    rows.into_iter().map(TryInto::try_into).collect()
+    Ok(convert_rows_skipping_invalid(rows))
 }
 
 const PENDING_ACME_CHALLENGES_SQL: &str = r#"
@@ -123,4 +142,36 @@ pub async fn fetch_pending_acme_challenges(pool: &MySqlPool) -> anyhow::Result<V
         .fetch_all(pool)
         .await
         .context("failed to fetch pending acme_challenges")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: u64, domain: &str, forward_host: &str) -> ProxyHostRow {
+        ProxyHostRow {
+            id,
+            domain: domain.to_string(),
+            forward_scheme: "http".to_string(),
+            forward_host: forward_host.to_string(),
+            forward_port: 80,
+            websockets_enabled: false,
+            version: 1,
+            ssl_certificate_id: None,
+            certificate_version: None,
+            certificate_storage_path: None,
+        }
+    }
+
+    #[test]
+    fn invalid_rows_are_skipped_without_dropping_valid_ones() {
+        let hosts = convert_rows_skipping_invalid(vec![
+            row(1, "a.example.com", "backend"),
+            row(2, "b.example.com", "evil; include /etc/passwd"),
+            row(3, "c.example.com", "10.0.0.7"),
+        ]);
+
+        let ids: Vec<u64> = hosts.iter().map(|h| h.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+    }
 }

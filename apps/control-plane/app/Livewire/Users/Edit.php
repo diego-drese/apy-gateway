@@ -8,9 +8,11 @@ use App\Actions\User\UpdateUserAction;
 use App\Models\User;
 use Illuminate\Validation\Rule;
 use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
 use Livewire\Component;
 
 #[Layout('layouts.app')]
+#[Title('Editar usuário')]
 class Edit extends Component
 {
     public User $user;

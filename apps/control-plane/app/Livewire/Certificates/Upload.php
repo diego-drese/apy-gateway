@@ -7,9 +7,11 @@ namespace App\Livewire\Certificates;
 use App\Actions\Certificate\UploadCertificateAction;
 use App\Models\SslCertificate;
 use Livewire\Attributes\Layout;
+use Livewire\Attributes\Title;
 use Livewire\Component;
 
 #[Layout('layouts.app')]
+#[Title('Enviar certificado')]
 class Upload extends Component
 {
     public string $certificate = '';
